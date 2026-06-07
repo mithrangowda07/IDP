@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import { serviceAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
@@ -14,6 +14,13 @@ export default function HospitalDashboard({ user, onLogout }) {
 
   // Socket state for tracking vehicle
   const [trackingPos, setTrackingPos] = useState(null);
+  const [corridorActive, setCorridorActive] = useState(false);
+  const [signals, setSignals] = useState([]);
+  const activeDispatchRef = useRef(null);
+
+  useEffect(() => {
+    activeDispatchRef.current = activeDispatch;
+  }, [activeDispatch]);
 
   useEffect(() => {
     // Connect to Socket.IO room
@@ -23,18 +30,26 @@ export default function HospitalDashboard({ user, onLogout }) {
 
     // Socket listeners
     socket.on('new_alert', (data) => {
+      if (String(data.dispatch.service_id) !== String(user.serviceId)) return;
       console.log('Hospital socket: new emergency alert received:', data);
       setAlerts(prev => [data.dispatch, ...prev]);
     });
 
     socket.on('vehicle_tracking_update', (data) => {
       console.log('Hospital socket: vehicle tracking tick:', data);
-      if (activeDispatch && activeDispatch.vehicle_id === data.vehicleId) {
+      const currentDispatch = activeDispatchRef.current;
+      if (currentDispatch && currentDispatch.vehicle_id === data.vehicleId) {
         setTrackingPos({
           latitude: parseFloat(data.latitude),
           longitude: parseFloat(data.longitude),
           progress: data.progress
         });
+        setVehicles(prev => prev.map(v => v.id === data.vehicleId ? {
+          ...v,
+          latitude: data.latitude,
+          longitude: data.longitude,
+          status: data.status
+        } : v));
       }
     });
 
@@ -56,17 +71,28 @@ export default function HospitalDashboard({ user, onLogout }) {
         return prev;
       });
 
-      // Reload dashboard if changes happened
-      loadDashboardData();
+    });
+
+    socket.on('green_corridor_update', (data) => {
+      const currentDispatch = activeDispatchRef.current;
+      if (!currentDispatch || currentDispatch.id !== data.dispatchId) return;
+
+      const isActive = data.status === 'active';
+      setCorridorActive(isActive);
+      setSignals(isActive ? data.signals : []);
+      if (isActive && Array.isArray(data.route) && data.route.length > 0) {
+        setActiveDispatch(prev => prev ? { ...prev, route_geometry: data.route } : prev);
+      }
     });
 
     return () => {
       socket.off('new_alert');
       socket.off('vehicle_tracking_update');
       socket.off('vehicle_status_change');
+      socket.off('green_corridor_update');
       disconnectSocket();
     };
-  }, [activeDispatch]);
+  }, []);
 
   const loadDashboardData = async () => {
     if (!user.serviceId) return;
@@ -78,6 +104,9 @@ export default function HospitalDashboard({ user, onLogout }) {
       // Load active dispatch
       const activeRes = await serviceAPI.getActiveDispatch(user.serviceId);
       setActiveDispatch(activeRes.data);
+      activeDispatchRef.current = activeRes.data;
+      setCorridorActive(Boolean(activeRes.data?.corridor_active));
+      setSignals(activeRes.data?.signals || []);
 
       // Load vehicle fleet
       const vehiclesRes = await serviceAPI.getVehicles(user.serviceId);
@@ -161,6 +190,30 @@ export default function HospitalDashboard({ user, onLogout }) {
       default: return 'bg-gray-500/10 text-gray-400';
     }
   };
+
+  const mapDispatch = activeDispatch || alerts[0] || null;
+  const mapService = mapDispatch ? {
+    id: mapDispatch.service_id || user.serviceId,
+    name: mapDispatch.service_name || user.name,
+    type: mapDispatch.service_type || 'hospital',
+    latitude: mapDispatch.service_lat,
+    longitude: mapDispatch.service_lng,
+    distance: mapDispatch.distance,
+    availableVehicles: vehicles.filter(v => v.status === 'available').length,
+    isRecommended: true
+  } : null;
+  const serviceCenter = mapService && mapService.latitude && mapService.longitude
+    ? [parseFloat(mapService.latitude), parseFloat(mapService.longitude)]
+    : [12.9716, 77.5946];
+  const incidentCenter = mapDispatch
+    ? [parseFloat(mapDispatch.incident_lat), parseFloat(mapDispatch.incident_lng)]
+    : null;
+  const mapCenter = incidentCenter && serviceCenter.every(Number.isFinite) && incidentCenter.every(Number.isFinite)
+    ? [
+        (serviceCenter[0] + incidentCenter[0]) / 2,
+        (serviceCenter[1] + incidentCenter[1]) / 2
+      ]
+    : serviceCenter;
 
   return (
     <div className="min-h-screen bg-[#070b13] flex flex-col">
@@ -344,22 +397,20 @@ export default function HospitalDashboard({ user, onLogout }) {
           </div>
           <div className="flex-1 rounded-xl overflow-hidden">
             <MapPanel
-              center={user.latitude ? [parseFloat(user.latitude), parseFloat(user.longitude)] : [12.9716, 77.5946]}
+              center={mapCenter}
               zoom={13}
-              incidents={activeDispatch ? [{
-                id: activeDispatch.incident_id,
-                latitude: activeDispatch.incident_lat,
-                longitude: activeDispatch.incident_lng,
-                type: activeDispatch.incident_type,
-                status: activeDispatch.status
+              incidents={mapDispatch ? [{
+                id: mapDispatch.incident_id,
+                latitude: mapDispatch.incident_lat,
+                longitude: mapDispatch.incident_lng,
+                type: mapDispatch.incident_type,
+                status: mapDispatch.status
               }] : []}
-              activeIncident={activeDispatch ? {
-                id: activeDispatch.incident_id,
-                latitude: activeDispatch.incident_lat,
-                longitude: activeDispatch.incident_lng
-              } : null}
-              routePoints={activeDispatch ? activeDispatch.route_geometry : []}
-              corridorActive={activeDispatch && activeDispatch.status === 'en_route'}
+              activeIncident={null}
+              nearbyServices={mapService ? [mapService] : []}
+              routePoints={mapDispatch ? mapDispatch.route_geometry : []}
+              corridorActive={corridorActive && activeDispatch?.status === 'en_route'}
+              signals={signals}
               trackingVehicle={activeDispatch && trackingPos ? {
                 id: activeDispatch.vehicle_id,
                 latitude: trackingPos.latitude,

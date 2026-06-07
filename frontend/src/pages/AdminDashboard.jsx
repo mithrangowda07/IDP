@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { adminAPI, incidentsAPI, trafficAPI } from '../services/api';
+import React, { useRef, useState, useEffect } from 'react';
+import { adminAPI, incidentsAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
-import { Shield, List, MapPin, Building, Check, X, ShieldAlert, Navigation, Clock, RefreshCw, Car } from 'lucide-react';
+import { Shield, List, Building, Check, X, ShieldAlert, RefreshCw, Car } from 'lucide-react';
 
 export default function AdminDashboard({ user, onLogout }) {
   const [activeTab, setActiveTab] = useState('incidents');
@@ -24,6 +24,11 @@ export default function AdminDashboard({ user, onLogout }) {
   const [routePoints, setRoutePoints] = useState([]);
   const [corridorActive, setCorridorActive] = useState(false);
   const [signals, setSignals] = useState([]);
+  const selectedIncidentRef = useRef(null);
+
+  useEffect(() => {
+    selectedIncidentRef.current = selectedIncident;
+  }, [selectedIncident]);
 
   useEffect(() => {
     // Connect to Socket.IO
@@ -84,13 +89,16 @@ export default function AdminDashboard({ user, onLogout }) {
         return prev;
       });
       // Refresh nearby services to show updated vehicle availability count
-      if (selectedIncident) {
-        loadNearbyServices(selectedIncident);
+      if (selectedIncidentRef.current) {
+        loadNearbyServices(selectedIncidentRef.current);
       }
     });
 
     socket.on('green_corridor_update', (data) => {
       console.log('Admin socket: corridor update:', data);
+      if (user.role === 'medical_admin' && !['accident', 'medical_emergency'].includes(data.incidentType)) return;
+      if (user.role === 'fire_admin' && !['fire', 'gas_leak'].includes(data.incidentType)) return;
+
       if (data.status === 'active') {
         setCorridorActive(true);
         setSignals(data.signals);
@@ -112,7 +120,7 @@ export default function AdminDashboard({ user, onLogout }) {
       socket.off('green_corridor_update');
       disconnectSocket();
     };
-  }, [selectedIncident]);
+  }, [user.role]);
 
   const loadIncidents = async () => {
     try {
@@ -158,34 +166,26 @@ export default function AdminDashboard({ user, onLogout }) {
       // Check route to the recommended service
       const recommended = response.data.find(s => s.isRecommended) || response.data[0];
       if (recommended) {
-        const routeResponse = await incidentsAPI.alertService.getPool; // Wait, let's query path check API
-        // Query path using custom routing API
         const pathResponse = await incidentsAPI.getIncidentDetails(incident.id); // Fetch updated dispatch details if any
         if (pathResponse.data.dispatch) {
           // If already dispatched/alerted, display existing route
           const dispatch = pathResponse.data.dispatch;
           setRouteInfo({
-            distance: dispatch.distance,
+            distance: dispatch.distance || 0,
             normalEta: dispatch.normal_eta,
             optimizedEta: dispatch.optimized_eta,
             timeSaved: dispatch.normal_eta - dispatch.optimized_eta
           });
-          // Check route points
-          try {
-            const pts = JSON.parse(dispatch.route_geometry);
-            setRoutePoints(pts);
-          } catch(e){}
+          setRoutePoints(Array.isArray(dispatch.route_geometry) ? dispatch.route_geometry : []);
+          setCorridorActive(Boolean(dispatch.corridor_active));
+          setSignals(dispatch.signals || []);
         } else {
           // Calculate temporary route for visualization
-          const routeRes = await incidentsAPI.getIncidentDetails(1); // dummy endpoint or direct call:
-          const routingCheck = await axios.get('http://localhost:5000/api/routing/check', {
-            params: {
-              startLat: recommended.latitude,
-              startLng: recommended.longitude,
-              endLat: incident.latitude,
-              endLng: incident.longitude
-            },
-            headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+          const routingCheck = await incidentsAPI.checkRoute({
+            startLat: recommended.latitude,
+            startLng: recommended.longitude,
+            endLat: incident.latitude,
+            endLng: incident.longitude
           });
           setRouteInfo({
             distance: routingCheck.data.distance,
@@ -206,7 +206,7 @@ export default function AdminDashboard({ user, onLogout }) {
   const handleAlertService = async (serviceId) => {
     if (!selectedIncident) return;
     try {
-      const response = await incidentsAPI.alertService(selectedIncident.id, serviceId);
+      await incidentsAPI.alertService(selectedIncident.id, serviceId);
       setFeedbackMsg('Emergency service has been successfully alerted!');
       setSelectedIncident(prev => ({ ...prev, status: 'service_alerted' }));
       // Reload incidents

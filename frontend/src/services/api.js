@@ -48,6 +48,7 @@ export const incidentsAPI = {
   getIncidents: () => api.get('/incidents'),
   getIncidentDetails: (id) => api.get(`/incidents/${id}`),
   getNearbyServices: (id) => api.get(`/incidents/${id}/nearby-services`),
+  checkRoute: (params) => api.get('/routing/check', { params }),
   alertService: (id, serviceId) => api.post(`/incidents/${id}/alert-service`, { serviceId }),
 };
 

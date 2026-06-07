@@ -1,5 +1,5 @@
-import React, { useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, useMap, useMapEvents } from 'react-leaflet';
+import React, { useEffect, useMemo, useRef } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, CircleMarker, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
@@ -42,14 +42,26 @@ function MapEventsHandler({ onClick }) {
 // Component to dynamically focus/fly-to coordinates
 function MapFocusHandler({ center, zoom }) {
   const map = useMap();
+  const lastViewRef = useRef('');
+
   useEffect(() => {
-    if (center) {
-      map.flyTo(center, zoom || map.getZoom(), {
+    if (!center || center.length < 2) return;
+
+    const nextCenter = [parseFloat(center[0]), parseFloat(center[1])];
+    if (!Number.isFinite(nextCenter[0]) || !Number.isFinite(nextCenter[1])) return;
+
+    const nextZoom = zoom || map.getZoom();
+    const viewKey = `${nextCenter[0].toFixed(6)},${nextCenter[1].toFixed(6)},${nextZoom}`;
+
+    if (lastViewRef.current !== viewKey) {
+      lastViewRef.current = viewKey;
+      map.flyTo(nextCenter, nextZoom, {
         animate: true,
-        duration: 1.2
+        duration: 0.8
       });
     }
-  }, [center, zoom, map]);
+  }, [center?.[0], center?.[1], zoom, map]);
+
   return null;
 }
 
@@ -121,6 +133,12 @@ export default function MapPanel({
     : center;
 
   const polylineColor = corridorActive ? '#10b981' : '#06b6d4'; // Green for corridor, cyan for default route
+  const routePositions = useMemo(
+    () => (Array.isArray(routePoints) ? routePoints : [])
+      .map(pt => [parseFloat(pt.lat), parseFloat(pt.lng)])
+      .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng)),
+    [routePoints]
+  );
 
   return (
     <div className="w-full h-full relative rounded-2xl overflow-hidden border border-white/10 shadow-inner">
@@ -191,10 +209,10 @@ export default function MapPanel({
         ))}
 
         {/* Active Route Polylines */}
-        {routePoints.length > 0 && (
+        {routePositions.length > 0 && (
           <>
             <Polyline
-              positions={routePoints.map(pt => [pt.lat, pt.lng])}
+              positions={routePositions}
               pathOptions={{
                 color: polylineColor,
                 weight: 6,
@@ -205,7 +223,7 @@ export default function MapPanel({
             {/* Outline corridor visual lane */}
             {corridorActive && (
               <Polyline
-                positions={routePoints.map(pt => [pt.lat, pt.lng])}
+                positions={routePositions}
                 pathOptions={{
                   color: '#10b981',
                   weight: 14,
@@ -222,18 +240,39 @@ export default function MapPanel({
           <CircleMarker
             key={signal.id}
             center={[signal.lat, signal.lng]}
-            radius={8}
+            radius={signal.status === 'green' ? 9 : 6}
             pathOptions={{
               fillColor: signal.status === 'green' ? '#10b981' : '#ef4444',
-              fillOpacity: 0.9,
+              fillOpacity: signal.status === 'green' ? 1 : 0.75,
               color: '#ffffff',
               weight: 2
             }}
           >
+            {signal.status === 'green' && (
+              <Tooltip
+                permanent
+                direction="top"
+                offset={[0, -8]}
+                opacity={0.95}
+              >
+                Signal cleared
+              </Tooltip>
+            )}
             <Popup>
               <div className="text-slate-900 text-xs">
-                Traffic Signal Status: <strong className={signal.status === 'green' ? 'text-emerald-600' : 'text-rose-600'}>{signal.status.toUpperCase()}</strong>
-                <p className="text-[10px] text-slate-400 mt-1">Priority Green Corridor Override</p>
+                Traffic Signal Status: <strong className={signal.status === 'green' ? 'text-emerald-600' : 'text-rose-600'}>
+                  {signal.status === 'green' ? 'CLEARED' : 'NORMAL'}
+                </strong>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  {signal.status === 'green'
+                    ? `${signal.distanceAhead ?? 0} m ahead - priority override active`
+                    : 'Waiting for vehicle to enter the 200 m clearance range'}
+                </p>
+                {signal.source === 'osm' && (
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    OSM signal #{signal.osmId} · {signal.distanceToRoute} m from route
+                  </p>
+                )}
               </div>
             </Popup>
           </CircleMarker>

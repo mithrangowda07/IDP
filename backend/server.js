@@ -517,6 +517,29 @@ app.get('/api/incidents/:id', authenticateJWT, async (req, res) => {
     );
     if (dispatches.length > 0) {
       incident.dispatch = dispatches[0];
+      const routePoints = parseRouteGeometry(incident.dispatch.route_geometry);
+      incident.dispatch.route_geometry = routePoints;
+      incident.dispatch.distance = getRouteDistanceKm(routePoints);
+
+      const [corridors] = await db.query(
+        `SELECT status, signals_state
+         FROM green_corridors
+         WHERE dispatch_id = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [incident.dispatch.id]
+      );
+      incident.dispatch.corridor_active = corridors[0]?.status === 'active';
+      const storedSignals = corridors[0]?.signals_state;
+      if (Array.isArray(storedSignals)) {
+        incident.dispatch.signals = storedSignals;
+      } else {
+        try {
+          incident.dispatch.signals = storedSignals ? JSON.parse(storedSignals) : [];
+        } catch (e) {
+          incident.dispatch.signals = [];
+        }
+      }
     }
 
     res.json(incident);
@@ -615,75 +638,94 @@ app.get('/api/incidents/:id/nearby-services', authenticateJWT, async (req, res) 
 });
 
 // ==========================================
-// ROUTING & OPENROUTESERVICE API
+// ROUTING & OSRM API
 // ==========================================
 
 async function calculateRoute(startLat, startLng, endLat, endLng) {
-  const apiKey = process.env.ORS_API_KEY;
+  const osrmBaseUrl = process.env.OSRM_BASE_URL || 'https://router.project-osrm.org';
+  const coordinates = `${startLng},${startLat};${endLng},${endLat}`;
+  const url = `${osrmBaseUrl.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
 
-  if (apiKey) {
-    try {
-      const response = await axios.post(
-        'https://api.openrouteservice.org/v2/directions/driving-car',
-        {
-          coordinates: [[startLng, startLat], [endLng, endLat]]
-        },
-        {
-          headers: {
-            'Authorization': apiKey,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+  try {
+    const response = await axios.get(url, {
+      params: {
+        overview: 'full',
+        geometries: 'geojson',
+        alternatives: false,
+        steps: false
+      },
+      timeout: 10000
+    });
 
-      const routeData = response.data;
-      if (routeData && routeData.features && routeData.features.length > 0) {
-        const feature = routeData.features[0];
-        const coordinates = feature.geometry.coordinates; // Array of [lng, lat]
-        const points = coordinates.map(coord => ({ lat: coord[1], lng: coord[0] }));
-        
-        const distanceMeters = feature.properties.summary.distance; // in meters
-        const durationSeconds = feature.properties.summary.duration; // in seconds
+    const routeData = response.data;
+    if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
+      const route = routeData.routes[0];
+      const points = route.geometry.coordinates.map(([lng, lat]) => ({
+        lat: parseFloat(lat.toFixed(6)),
+        lng: parseFloat(lng.toFixed(6))
+      }));
 
-        return {
-          points,
-          distance: parseFloat((distanceMeters / 1000).toFixed(2)), // in km
-          duration: Math.ceil(durationSeconds / 60) // in minutes
-        };
-      }
-    } catch (err) {
-      console.warn('OpenRouteService request failed. Falling back to routing simulator.', err.message);
+      return {
+        points,
+        distance: parseFloat((route.distance / 1000).toFixed(2)),
+        duration: Math.max(1, Math.ceil(route.duration / 60)),
+        provider: 'osrm'
+      };
     }
+
+    console.warn('OSRM returned no route. Falling back to direct route.', routeData?.code || 'unknown');
+  } catch (err) {
+    console.warn('OSRM request failed. Falling back to direct route.', err.message);
   }
 
-  // FALLBACK ROUTING SIMULATOR
-  // Calculate direct distance
   const distance = getHaversineDistance(startLat, startLng, endLat, endLng);
-  // Generate 15 interpolated path nodes with minor zig-zags to look like roads
-  const points = [];
-  const steps = 15;
-  for (let i = 0; i <= steps; i++) {
-    const ratio = i / steps;
-    let lat = startLat + (endLat - startLat) * ratio;
-    let lng = startLng + (endLng - startLng) * ratio;
-
-    // Add noise to simulate streets
-    if (i > 0 && i < steps) {
-      lat += (Math.random() - 0.5) * 0.0015;
-      lng += (Math.random() - 0.5) * 0.0015;
+  const points = [
+    {
+      lat: parseFloat(startLat.toFixed(6)),
+      lng: parseFloat(startLng.toFixed(6))
+    },
+    {
+      lat: parseFloat(endLat.toFixed(6)),
+      lng: parseFloat(endLng.toFixed(6))
     }
-    points.push({ lat: parseFloat(lat.toFixed(6)), lng: parseFloat(lng.toFixed(6)) });
-  }
-
-  // Assume avg city speed 40km/h
+  ];
   const avgSpeedKmh = 40;
   const durationMinutes = Math.max(2, Math.ceil((distance / avgSpeedKmh) * 60));
 
   return {
     points,
     distance: parseFloat(distance.toFixed(2)),
-    duration: durationMinutes
+    duration: durationMinutes,
+    provider: 'fallback_direct'
   };
+}
+
+function parseRouteGeometry(routeGeometry) {
+  if (Array.isArray(routeGeometry)) return routeGeometry;
+  if (!routeGeometry) return [];
+
+  try {
+    const parsed = JSON.parse(routeGeometry);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function getRouteDistanceKm(points) {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+
+  let distance = 0;
+  for (let i = 1; i < points.length; i++) {
+    distance += getHaversineDistance(
+      parseFloat(points[i - 1].lat),
+      parseFloat(points[i - 1].lng),
+      parseFloat(points[i].lat),
+      parseFloat(points[i].lng)
+    );
+  }
+
+  return parseFloat(distance.toFixed(2));
 }
 
 // Route check API
@@ -777,8 +819,17 @@ app.post('/api/incidents/:id/alert-service', authenticateJWT, authorizeRoles('me
       service_type: service.type,
       status: 'awaiting_response',
       route_geometry: route.points,
+      distance: route.distance,
       normal_eta: normalEta,
-      optimized_eta: optimizedEta
+      optimized_eta: optimizedEta,
+      incident_type: incident.type,
+      incident_lat: incident.latitude,
+      incident_lng: incident.longitude,
+      incident_description: incident.description,
+      service_name: service.name,
+      service_type: service.type,
+      service_lat: service.latitude,
+      service_lng: service.longitude
     };
 
     // Broadcast to service via Socket.IO
@@ -800,19 +851,19 @@ app.get('/api/services/:id/alerts', authenticateJWT, authorizeRoles('hospital_us
   const serviceId = req.params.id;
   try {
     const [dispatches] = await db.query(
-      `SELECT d.*, i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.description as incident_description
+      `SELECT d.*, 
+              i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.description as incident_description,
+              s.name as service_name, s.type as service_type, s.latitude as service_lat, s.longitude as service_lng
        FROM dispatches d
        JOIN incidents i ON d.incident_id = i.id
+       JOIN services s ON d.service_id = s.id
        WHERE d.service_id = ? AND d.status = "awaiting_response"`,
       [serviceId]
     );
 
     for (const d of dispatches) {
-      try {
-        d.route_geometry = JSON.parse(d.route_geometry);
-      } catch (e) {
-        d.route_geometry = [];
-      }
+      d.route_geometry = parseRouteGeometry(d.route_geometry);
+      d.distance = getRouteDistanceKm(d.route_geometry);
     }
 
     res.json(dispatches);
@@ -827,20 +878,41 @@ app.get('/api/services/:id/active-dispatch', authenticateJWT, authorizeRoles('ho
   const serviceId = req.params.id;
   try {
     const [dispatches] = await db.query(
-      `SELECT d.*, i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.description as incident_description
+      `SELECT d.*, 
+              i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.description as incident_description,
+              s.name as service_name, s.type as service_type, s.latitude as service_lat, s.longitude as service_lng
        FROM dispatches d
        JOIN incidents i ON d.incident_id = i.id
+       JOIN services s ON d.service_id = s.id
        WHERE d.service_id = ? AND d.status IN ("dispatched", "en_route", "at_scene", "returning")`,
       [serviceId]
     );
 
     if (dispatches.length > 0) {
       const d = dispatches[0];
-      try {
-        d.route_geometry = JSON.parse(d.route_geometry);
-      } catch (e) {
-        d.route_geometry = [];
+      d.route_geometry = parseRouteGeometry(d.route_geometry);
+      d.distance = getRouteDistanceKm(d.route_geometry);
+
+      const [corridors] = await db.query(
+        `SELECT status, signals_state
+         FROM green_corridors
+         WHERE dispatch_id = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [d.id]
+      );
+      d.corridor_active = corridors[0]?.status === 'active';
+      const storedSignals = corridors[0]?.signals_state;
+      if (Array.isArray(storedSignals)) {
+        d.signals = storedSignals;
+      } else {
+        try {
+          d.signals = storedSignals ? JSON.parse(storedSignals) : [];
+        } catch (e) {
+          d.signals = [];
+        }
       }
+
       return res.json(d);
     }
     res.json(null);
