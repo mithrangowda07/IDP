@@ -65,6 +65,90 @@ function MapFocusHandler({ center, zoom }) {
   return null;
 }
 
+function SmoothVehicleMarker({ vehicle, icon }) {
+  const markerRef = useRef(null);
+  const animationRef = useRef(null);
+  const lastPositionRef = useRef(null);
+
+  const targetPosition = useMemo(
+    () => [parseFloat(vehicle.latitude), parseFloat(vehicle.longitude)],
+    [vehicle.latitude, vehicle.longitude]
+  );
+
+  useEffect(() => {
+    const marker = markerRef.current;
+    if (!marker || !Number.isFinite(targetPosition[0]) || !Number.isFinite(targetPosition[1])) return;
+
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+    }
+
+    const currentLatLng = marker.getLatLng();
+    const from = lastPositionRef.current || [currentLatLng.lat, currentLatLng.lng];
+    const to = targetPosition;
+    const distance = Math.hypot(to[0] - from[0], to[1] - from[1]);
+
+    if (!Number.isFinite(distance) || distance === 0) {
+      marker.setLatLng(to);
+      lastPositionRef.current = to;
+      return;
+    }
+
+    const durationMs = 900;
+    const startTime = performance.now();
+
+    const animate = (now) => {
+      const progress = Math.min((now - startTime) / durationMs, 1);
+      const easedProgress = progress < 0.5
+        ? 2 * progress * progress
+        : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+      const nextLat = from[0] + (to[0] - from[0]) * easedProgress;
+      const nextLng = from[1] + (to[1] - from[1]) * easedProgress;
+
+      marker.setLatLng([nextLat, nextLng]);
+      lastPositionRef.current = [nextLat, nextLng];
+
+      if (progress < 1) {
+        animationRef.current = requestAnimationFrame(animate);
+      } else {
+        lastPositionRef.current = to;
+      }
+    };
+
+    animationRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [targetPosition[0], targetPosition[1]]);
+
+  if (!Number.isFinite(targetPosition[0]) || !Number.isFinite(targetPosition[1])) return null;
+
+  return (
+    <Marker
+      ref={markerRef}
+      position={lastPositionRef.current || targetPosition}
+      icon={icon}
+      zIndexOffset={1000}
+    >
+      <Popup>
+        <div className="text-slate-900 p-1">
+          <h4 className="font-bold text-xs uppercase">Vehicle tracking: {vehicle.id}</h4>
+          <p className="text-[10px]">Type: {vehicle.type}</p>
+          <p className="text-[10px] mt-0.5">Status: <strong className="text-emerald-600">{vehicle.status.replace('_', ' ')}</strong></p>
+          {vehicle.progress !== undefined && (
+            <div className="w-full bg-slate-200 h-1.5 rounded-full mt-2 overflow-hidden">
+              <div className="bg-emerald-500 h-1.5 rounded-full" style={{ width: `${vehicle.progress}%` }}></div>
+            </div>
+          )}
+        </div>
+      </Popup>
+    </Marker>
+  );
+}
+
 export default function MapPanel({
   center = [12.9716, 77.5946], // Bangalore center
   zoom = 12,
@@ -138,6 +222,10 @@ export default function MapPanel({
       .map(pt => [parseFloat(pt.lat), parseFloat(pt.lng)])
       .filter(([lat, lng]) => Number.isFinite(lat) && Number.isFinite(lng)),
     [routePoints]
+  );
+  const trackingVehicleIcon = useMemo(
+    () => trackingVehicle ? getVehicleIcon(trackingVehicle.type, trackingVehicle.status) : null,
+    [trackingVehicle?.type, trackingVehicle?.status]
   );
 
   return (
@@ -279,25 +367,8 @@ export default function MapPanel({
         ))}
 
         {/* Active Moving Tracking Vehicle Marker */}
-        {trackingVehicle && (
-          <Marker
-            position={[trackingVehicle.latitude, trackingVehicle.longitude]}
-            icon={getVehicleIcon(trackingVehicle.type, trackingVehicle.status)}
-            zIndexOffset={1000}
-          >
-            <Popup>
-              <div className="text-slate-900 p-1">
-                <h4 className="font-bold text-xs uppercase">Vehicle tracking: {trackingVehicle.id}</h4>
-                <p className="text-[10px]">Type: {trackingVehicle.type}</p>
-                <p className="text-[10px] mt-0.5">Status: <strong className="text-emerald-600">{trackingVehicle.status.replace('_', ' ')}</strong></p>
-                {trackingVehicle.progress !== undefined && (
-                  <div className="w-full bg-slate-200 h-1.5 rounded-full mt-2 overflow-hidden">
-                    <div className="bg-emerald-500 h-1.5 rounded-full" style={{ width: `${trackingVehicle.progress}%` }}></div>
-                  </div>
-                )}
-              </div>
-            </Popup>
-          </Marker>
+        {trackingVehicle && trackingVehicleIcon && (
+          <SmoothVehicleMarker vehicle={trackingVehicle} icon={trackingVehicleIcon} />
         )}
       </MapContainer>
 

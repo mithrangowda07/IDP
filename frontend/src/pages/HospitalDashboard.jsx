@@ -64,9 +64,16 @@ export default function HospitalDashboard({ user, onLogout }) {
           // If returned to available, clear active dispatch
           if (data.status === 'available') {
             setTrackingPos(null);
+            activeDispatchRef.current = null;
             return null;
           }
-          return { ...prev, status: data.status };
+          const nextDispatch = {
+            ...prev,
+            status: data.status,
+            ...(Array.isArray(data.route) && data.route.length > 0 ? { route_geometry: data.route } : {})
+          };
+          activeDispatchRef.current = nextDispatch;
+          return nextDispatch;
         }
         return prev;
       });
@@ -313,7 +320,7 @@ export default function HospitalDashboard({ user, onLogout }) {
 
                     {activeDispatch.status === 'returning' && (
                       <div className="p-3 bg-amber-500/5 border border-amber-500/20 rounded-xl text-center text-xs text-amber-400 font-bold">
-                        Ambulance is returning to station. Simulated route active...
+                        Ambulance is returning with a fresh green corridor route active...
                       </div>
                     )}
                   </div>
@@ -409,7 +416,7 @@ export default function HospitalDashboard({ user, onLogout }) {
               activeIncident={null}
               nearbyServices={mapService ? [mapService] : []}
               routePoints={mapDispatch ? mapDispatch.route_geometry : []}
-              corridorActive={corridorActive && activeDispatch?.status === 'en_route'}
+              corridorActive={corridorActive && ['en_route', 'returning'].includes(activeDispatch?.status)}
               signals={signals}
               trackingVehicle={activeDispatch && trackingPos ? {
                 id: activeDispatch.vehicle_id,

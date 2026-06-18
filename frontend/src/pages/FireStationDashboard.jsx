@@ -63,9 +63,16 @@ export default function FireStationDashboard({ user, onLogout }) {
         if (prev && prev.vehicle_id === data.vehicleId) {
           if (data.status === 'available') {
             setTrackingPos(null);
+            activeDispatchRef.current = null;
             return null;
           }
-          return { ...prev, status: data.status };
+          const nextDispatch = {
+            ...prev,
+            status: data.status,
+            ...(Array.isArray(data.route) && data.route.length > 0 ? { route_geometry: data.route } : {})
+          };
+          activeDispatchRef.current = nextDispatch;
+          return nextDispatch;
         }
         return prev;
       });
@@ -307,7 +314,7 @@ export default function FireStationDashboard({ user, onLogout }) {
 
                     {activeDispatch.status === 'returning' && (
                       <div className="p-3 bg-amber-500/5 border border-amber-500/20 rounded-xl text-center text-xs text-amber-400 font-bold">
-                        Fire Engine is returning to station. Simulated route active...
+                        Fire Engine is returning on the fresh shortest route...
                       </div>
                     )}
                   </div>

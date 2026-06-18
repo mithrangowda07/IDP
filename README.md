@@ -111,5 +111,5 @@ We have seeded preset active admin accounts for immediate testing. They can be t
 
 ### 4. Real-time Tracking & Corridor Override
 - In the dispatch panel, when marked **En Route**, the server launches an interval loop that updates coordinates and broadcasts updates via **Socket.IO** every 5 seconds.
-- Approaches traffic signals along the route and changes their status to **Green** (visual indicator overlay).
+- Changes traffic signals to **Green** when the emergency vehicle is within **500 meters** of the signal (visual indicator overlay).
 - Automatically reaches scene (**At Scene**) and deactivates corridor. On operator clicking **Resolve**, the vehicle returns to station reversing the route coordinates and transitions to **Available**.

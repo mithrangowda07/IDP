@@ -4,10 +4,15 @@ const db = require('./db');
 
 let io;
 const activeSimulations = {}; // dispatchId -> intervalInfo
-const SIGNAL_CLEARANCE_DISTANCE_METERS = 300;
+const SIGNAL_CLEARANCE_DISTANCE_METERS = 500;
+const SIGNAL_PASSED_PERSIST_DISTANCE_METERS = 60;
 const SIGNAL_ROUTE_MATCH_DISTANCE_METERS = parseInt(process.env.SIGNAL_ROUTE_MATCH_DISTANCE_METERS || '0', 10);
+const SIGNAL_DEDUPE_DISTANCE_METERS = 75;
+const VEHICLE_STEP_DISTANCE_METERS = 25;
+const VEHICLE_TRACKING_INTERVAL_MS = 1000;
 const OVERPASS_API_URL = process.env.OVERPASS_API_URL || 'https://overpass-api.de/api/interpreter';
 const USE_SYNTHETIC_SIGNAL_FALLBACK = process.env.USE_SYNTHETIC_SIGNAL_FALLBACK === 'true';
+const OSRM_BASE_URL = process.env.OSRM_BASE_URL || 'https://router.project-osrm.org';
 
 function getDistanceMeters(a, b) {
   const earthRadiusMeters = 6371000;
@@ -28,6 +33,76 @@ function getCumulativeRouteDistances(route) {
     distances.push(distances[i - 1] + getDistanceMeters(route[i - 1], route[i]));
   }
   return distances;
+}
+
+function getRoutePointAtDistance(route, routeDistances, targetDistance) {
+  if (!Array.isArray(route) || route.length === 0) return null;
+  if (targetDistance <= 0) return { ...route[0], routeIndex: 0 };
+
+  const totalDistance = routeDistances[routeDistances.length - 1] || 0;
+  if (targetDistance >= totalDistance) {
+    return { ...route[route.length - 1], routeIndex: route.length - 1 };
+  }
+
+  const routeIndex = routeDistances.findIndex((distance, index) =>
+    index > 0 && distance >= targetDistance
+  );
+
+  if (routeIndex <= 0) return { ...route[0], routeIndex: 0 };
+
+  const previousDistance = routeDistances[routeIndex - 1];
+  const nextDistance = routeDistances[routeIndex];
+  const segmentDistance = nextDistance - previousDistance;
+  const ratio = segmentDistance > 0
+    ? (targetDistance - previousDistance) / segmentDistance
+    : 0;
+  const start = route[routeIndex - 1];
+  const end = route[routeIndex];
+
+  return {
+    lat: parseFloat((parseFloat(start.lat) + (parseFloat(end.lat) - parseFloat(start.lat)) * ratio).toFixed(6)),
+    lng: parseFloat((parseFloat(start.lng) + (parseFloat(end.lng) - parseFloat(start.lng)) * ratio).toFixed(6)),
+    routeIndex
+  };
+}
+
+function toFiniteCoordinate(value) {
+  const coordinate = parseFloat(value);
+  return Number.isFinite(coordinate) ? coordinate : null;
+}
+
+async function calculateRoute(startLat, startLng, endLat, endLng) {
+  const coordinates = `${startLng},${startLat};${endLng},${endLat}`;
+  const url = `${OSRM_BASE_URL.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
+
+  try {
+    const response = await axios.get(url, {
+      params: {
+        overview: 'full',
+        geometries: 'geojson',
+        alternatives: false,
+        steps: false
+      },
+      timeout: 10000
+    });
+
+    const routeData = response.data;
+    if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
+      return routeData.routes[0].geometry.coordinates.map(([lng, lat]) => ({
+        lat: parseFloat(lat.toFixed(6)),
+        lng: parseFloat(lng.toFixed(6))
+      }));
+    }
+
+    console.warn('OSRM returned no return route. Falling back to direct route.', routeData?.code || 'unknown');
+  } catch (err) {
+    console.warn('OSRM return route request failed. Falling back to direct route.', err.message);
+  }
+
+  return [
+    { lat: parseFloat(startLat.toFixed(6)), lng: parseFloat(startLng.toFixed(6)) },
+    { lat: parseFloat(endLat.toFixed(6)), lng: parseFloat(endLng.toFixed(6)) }
+  ];
 }
 
 function generateSyntheticSignals(dispatchId, route, routeDistances) {
@@ -132,6 +207,22 @@ function getRouteBoundingBox(route, paddingDegrees = 0.003) {
   };
 }
 
+function keepFirstSignalWithinDistance(signals) {
+  const keptSignals = [];
+
+  for (const signal of signals) {
+    const isTooCloseToPrevious = keptSignals.some(
+      keptSignal => Math.abs(signal.distanceAlongRoute - keptSignal.distanceAlongRoute) < SIGNAL_DEDUPE_DISTANCE_METERS
+    );
+
+    if (!isTooCloseToPrevious) {
+      keptSignals.push(signal);
+    }
+  }
+
+  return keptSignals;
+}
+
 async function fetchSignalsOnRoute(dispatchId, route, routeDistances) {
   if (!Array.isArray(route) || route.length < 2) return [];
 
@@ -173,15 +264,16 @@ async function fetchSignalsOnRoute(dispatchId, route, routeDistances) {
       seenNodeIds.add(signal.osmId);
       return signal.distanceToRoute <= SIGNAL_ROUTE_MATCH_DISTANCE_METERS;
     })
-    .sort((a, b) => a.distanceAlongRoute - b.distanceAlongRoute)
-    .slice(0, 30);
+    .sort((a, b) => a.distanceAlongRoute - b.distanceAlongRoute);
+  const dedupedCandidates = keepFirstSignalWithinDistance(candidates).slice(0, 30);
 
   console.log(
     `OSM traffic signals for dispatch ${dispatchId}: ` +
-    `${response.data?.elements?.length || 0} fetched, ${candidates.length} matched within ${SIGNAL_ROUTE_MATCH_DISTANCE_METERS}m`
+    `${response.data?.elements?.length || 0} fetched, ${candidates.length} matched within ${SIGNAL_ROUTE_MATCH_DISTANCE_METERS}m, ` +
+    `${dedupedCandidates.length} kept after ${SIGNAL_DEDUPE_DISTANCE_METERS}m dedupe`
   );
 
-  return candidates;
+  return dedupedCandidates;
 }
 
 async function generateSignals(dispatchId, route, routeDistances) {
@@ -206,12 +298,19 @@ async function generateSignals(dispatchId, route, routeDistances) {
 function updateSignalStates(signals, vehicleDistance) {
   return signals.map(signal => {
     const distanceAhead = signal.distanceAlongRoute - vehicleDistance;
+    const hasJustBeenPassed =
+      signal.status === 'green' &&
+      vehicleDistance > signal.distanceAlongRoute &&
+      vehicleDistance <= signal.distanceAlongRoute + SIGNAL_PASSED_PERSIST_DISTANCE_METERS;
+    const shouldClear =
+      (distanceAhead >= 0 && distanceAhead <= SIGNAL_CLEARANCE_DISTANCE_METERS) ||
+      hasJustBeenPassed;
+
     return {
       ...signal,
       distanceAhead: Math.max(0, Math.round(distanceAhead)),
-      status: distanceAhead >= 0 && distanceAhead <= SIGNAL_CLEARANCE_DISTANCE_METERS
-        ? 'green'
-        : 'normal'
+      passed: vehicleDistance > signal.distanceAlongRoute,
+      status: shouldClear ? 'green' : 'normal'
     };
   });
 }
@@ -356,25 +455,21 @@ async function startTrackingSimulation(dispatchId) {
       dispatchId
     });
 
-    let currentIndex = 0;
-    const N = route.length;
+    let vehicleDistance = 0;
+    const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
 
     const intervalId = setInterval(async () => {
-      const nextDistance = routeDistances[currentIndex] + 350;
-      const nextIndex = routeDistances.findIndex((distance, index) =>
-        index > currentIndex && distance >= nextDistance
-      );
-      currentIndex = nextIndex === -1 ? N - 1 : nextIndex;
-
-      const pt = route[currentIndex];
-      const progress = (currentIndex / (N - 1)) * 100;
+      vehicleDistance = Math.min(vehicleDistance + VEHICLE_STEP_DISTANCE_METERS, totalRouteDistance);
+      const pt = getRoutePointAtDistance(route, routeDistances, vehicleDistance);
+      if (!pt) return;
+      const progress = totalRouteDistance > 0 ? (vehicleDistance / totalRouteDistance) * 100 : 100;
 
       // Update vehicle location in DB
       await db.query('UPDATE vehicles SET latitude = ?, longitude = ? WHERE id = ?', [pt.lat, pt.lng, dispatch.vehicle_id]);
       // Log location history
       await db.query('INSERT INTO vehicle_tracking (vehicle_id, latitude, longitude) VALUES (?, ?, ?)', [dispatch.vehicle_id, pt.lat, pt.lng]);
 
-      signals = updateSignalStates(signals, routeDistances[currentIndex]);
+      signals = updateSignalStates(signals, vehicleDistance);
       await db.query(
         'UPDATE green_corridors SET signals_state = ? WHERE id = ?',
         [JSON.stringify(signals), corridorId]
@@ -400,7 +495,7 @@ async function startTrackingSimulation(dispatchId) {
       });
 
       // If reached destination
-      if (currentIndex >= N - 1) {
+      if (vehicleDistance >= totalRouteDistance) {
         clearInterval(intervalId);
         delete activeSimulations[dispatchId];
 
@@ -423,7 +518,7 @@ async function startTrackingSimulation(dispatchId) {
           route: []
         });
       }
-    }, 5000);
+    }, VEHICLE_TRACKING_INTERVAL_MS);
 
     activeSimulations[dispatchId] = { intervalId, corridorId, route };
 
@@ -433,55 +528,92 @@ async function startTrackingSimulation(dispatchId) {
 }
 
 async function startReturnSimulation(dispatchId) {
+  if (activeSimulations[dispatchId]) {
+    clearInterval(activeSimulations[dispatchId].intervalId);
+    delete activeSimulations[dispatchId];
+  }
+
   try {
     const [dispatches] = await db.query(
-      `SELECT d.*, s.latitude as s_lat, s.longitude as s_lng
+      `SELECT d.*, s.latitude as s_lat, s.longitude as s_lng, s.type as s_type,
+              i.latitude as i_lat, i.longitude as i_lng, i.type as i_type,
+              v.latitude as v_lat, v.longitude as v_lng, v.type as vehicle_type
        FROM dispatches d
        JOIN services s ON d.service_id = s.id
+       JOIN incidents i ON d.incident_id = i.id
+       JOIN vehicles v ON d.vehicle_id = v.id
        WHERE d.id = ?`,
       [dispatchId]
     );
 
     if (dispatches.length === 0) return;
     const dispatch = dispatches[0];
+    const isAmbulance = dispatch.vehicle_type === 'ambulance';
 
-    // Load original route and reverse it
-    let route = [];
-    try {
-      route = JSON.parse(dispatch.route_geometry);
-    } catch (e) {
-      console.error('Failed to parse route', e);
+    const stationLat = toFiniteCoordinate(dispatch.s_lat);
+    const stationLng = toFiniteCoordinate(dispatch.s_lng);
+    let startLat = toFiniteCoordinate(dispatch.v_lat) ?? toFiniteCoordinate(dispatch.i_lat);
+    let startLng = toFiniteCoordinate(dispatch.v_lng) ?? toFiniteCoordinate(dispatch.i_lng);
+
+    if (startLat === null || startLng === null || stationLat === null || stationLng === null) {
+      console.error(`Cannot calculate return route for dispatch ${dispatchId}: missing coordinates.`);
       return;
     }
 
-    if (!route || route.length === 0) {
-      // Just simulate straight line
-      route = [
-        { lat: dispatch.latitude, lng: dispatch.longitude },
-        { lat: dispatch.s_lat, lng: dispatch.s_lng }
-      ];
-    }
-
-    const returnRoute = route.slice().reverse();
+    const returnRoute = await calculateRoute(startLat, startLng, stationLat, stationLng);
+    const routeDistances = getCumulativeRouteDistances(returnRoute);
+    let returnSignals = [];
+    let returnCorridorId = null;
 
     // Set status
     await db.query('UPDATE vehicles SET status = "returning" WHERE id = ?', [dispatch.vehicle_id]);
-    await db.query('UPDATE dispatches SET status = "returning" WHERE id = ?', [dispatchId]);
+    await db.query(
+      'UPDATE dispatches SET status = "returning", route_geometry = ? WHERE id = ?',
+      [JSON.stringify(returnRoute), dispatchId]
+    );
     
-    io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'returning' });
+    io.emit('vehicle_status_change', {
+      vehicleId: dispatch.vehicle_id,
+      status: 'returning',
+      route: returnRoute
+    });
 
-    let currentIndex = 0;
-    const N = returnRoute.length;
-    const stepSize = Math.max(1, Math.ceil(N / 10));
+    if (isAmbulance) {
+      const [corridorResult] = await db.query(
+        'INSERT INTO green_corridors (dispatch_id, status, signals_state) VALUES (?, "active", ?)',
+        [dispatchId, JSON.stringify([])]
+      );
+      returnCorridorId = corridorResult.insertId;
+      returnSignals = updateSignalStates(
+        await generateSignals(dispatchId, returnRoute, routeDistances),
+        routeDistances[0]
+      );
+
+      await db.query(
+        'UPDATE green_corridors SET signals_state = ? WHERE id = ?',
+        [JSON.stringify(returnSignals), returnCorridorId]
+      );
+
+      io.emit('green_corridor_update', {
+        dispatchId,
+        incidentType: dispatch.i_type,
+        serviceType: dispatch.s_type,
+        vehicleId: dispatch.vehicle_id,
+        status: 'active',
+        phase: 'returning',
+        signals: returnSignals,
+        route: returnRoute
+      });
+    }
+
+    let vehicleDistance = 0;
+    const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
 
     const intervalId = setInterval(async () => {
-      currentIndex += stepSize;
-      if (currentIndex >= N - 1) {
-        currentIndex = N - 1;
-      }
-
-      const pt = returnRoute[currentIndex];
-      const progress = (currentIndex / (N - 1)) * 100;
+      vehicleDistance = Math.min(vehicleDistance + VEHICLE_STEP_DISTANCE_METERS, totalRouteDistance);
+      const pt = getRoutePointAtDistance(returnRoute, routeDistances, vehicleDistance);
+      if (!pt) return;
+      const progress = totalRouteDistance > 0 ? (vehicleDistance / totalRouteDistance) * 100 : 100;
 
       // Update vehicle location in DB
       await db.query('UPDATE vehicles SET latitude = ?, longitude = ? WHERE id = ?', [pt.lat, pt.lng, dispatch.vehicle_id]);
@@ -496,16 +628,53 @@ async function startReturnSimulation(dispatchId) {
         dispatchId
       });
 
-      if (currentIndex >= N - 1) {
+      if (isAmbulance && returnCorridorId) {
+        returnSignals = updateSignalStates(returnSignals, vehicleDistance);
+        await db.query(
+          'UPDATE green_corridors SET signals_state = ? WHERE id = ?',
+          [JSON.stringify(returnSignals), returnCorridorId]
+        );
+
+        io.emit('green_corridor_update', {
+          dispatchId,
+          incidentType: dispatch.i_type,
+          serviceType: dispatch.s_type,
+          vehicleId: dispatch.vehicle_id,
+          status: 'active',
+          phase: 'returning',
+          signals: returnSignals,
+          route: returnRoute
+        });
+      }
+
+      if (vehicleDistance >= totalRouteDistance) {
         clearInterval(intervalId);
+        delete activeSimulations[dispatchId];
         
         // Return completed, vehicle available
         await db.query('UPDATE vehicles SET status = "available", latitude = ?, longitude = ? WHERE id = ?', [dispatch.s_lat, dispatch.s_lng, dispatch.vehicle_id]);
         await db.query('UPDATE dispatches SET status = "completed" WHERE id = ?', [dispatchId]);
+        if (returnCorridorId) {
+          await db.query('UPDATE green_corridors SET status = "inactive" WHERE id = ?', [returnCorridorId]);
+        }
 
         io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+        if (isAmbulance) {
+          io.emit('green_corridor_update', {
+            dispatchId,
+            incidentType: dispatch.i_type,
+            serviceType: dispatch.s_type,
+            vehicleId: dispatch.vehicle_id,
+            status: 'inactive',
+            phase: 'returning',
+            signals: [],
+            route: []
+          });
+        }
       }
-    }, 5000);
+    }, VEHICLE_TRACKING_INTERVAL_MS);
+
+    activeSimulations[dispatchId] = { intervalId, corridorId: returnCorridorId, route: returnRoute };
 
   } catch (err) {
     console.error('Error in startReturnSimulation:', err);
