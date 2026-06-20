@@ -23,6 +23,12 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'emergency-jwt-super-secret-key-1536';
 const PORT = process.env.PORT || 5000;
+const INCIDENT_TYPES = ['medical_emergency', 'accident', 'fire', 'gas_leak', 'building_collapse', 'other'];
+const FIRE_INCIDENT_TYPES = ['fire', 'gas_leak', 'building_collapse'];
+const EMERGENCY_CONTACT_KEYS = {
+  medicalPhone: 'medical_emergency_coordinator_phone',
+  firePhone: 'fire_emergency_coordinator_phone'
+};
 
 // Configure Multer for in-memory file uploads
 const upload = multer({
@@ -58,15 +64,43 @@ function authorizeRoles(...roles) {
   };
 }
 
+function normalizeIncidentType(type) {
+  return String(type || '').toLowerCase().trim();
+}
+
+function isValidIncidentType(type) {
+  return INCIDENT_TYPES.includes(normalizeIncidentType(type));
+}
+
+function getCoordinatorType(type) {
+  const normalizedType = normalizeIncidentType(type);
+  return FIRE_INCIDENT_TYPES.includes(normalizedType) ? 'fire' : 'medical';
+}
+
+async function getEmergencyContacts() {
+  const [rows] = await db.query(
+    `SELECT setting_key, setting_value
+     FROM system_settings
+     WHERE setting_key IN (?, ?)`,
+    [EMERGENCY_CONTACT_KEYS.medicalPhone, EMERGENCY_CONTACT_KEYS.firePhone]
+  );
+
+  const settings = Object.fromEntries(rows.map((row) => [row.setting_key, row.setting_value]));
+  return {
+    medicalPhone: settings[EMERGENCY_CONTACT_KEYS.medicalPhone] || '',
+    firePhone: settings[EMERGENCY_CONTACT_KEYS.firePhone] || ''
+  };
+}
+
 // ==========================================
 // AUTHENTICATION ROUTES
 // ==========================================
 
 // Citizen Registration
 app.post('/api/auth/register-citizen', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: 'Name, email, and password are required.' });
+  const { name, email, password, phone, emergencyContact } = req.body;
+  if (!name || !email || !password || !phone) {
+    return res.status(400).json({ error: 'Name, email, password, and phone number are required.' });
   }
 
   try {
@@ -85,8 +119,8 @@ app.post('/api/auth/register-citizen', async (req, res) => {
 
     // Insert citizen details
     await db.query(
-      'INSERT INTO citizens (user_id, name) VALUES (?, ?)',
-      [userResult.insertId, name]
+      'INSERT INTO citizens (user_id, name, phone, emergency_contact) VALUES (?, ?, ?, ?)',
+      [userResult.insertId, name, phone, emergencyContact || null]
     );
 
     res.status(201).json({ message: 'Citizen registered successfully.' });
@@ -284,6 +318,47 @@ app.post('/api/auth/login', async (req, res) => {
 // ADMIN API
 // ==========================================
 
+// Emergency coordinator contact numbers (readable by authenticated users for native phone dialing)
+app.get('/api/emergency-contacts', authenticateJWT, async (req, res) => {
+  try {
+    res.json(await getEmergencyContacts());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Update emergency coordinator contact numbers
+app.put('/api/admin/emergency-contacts', authenticateJWT, authorizeRoles('medical_admin', 'fire_admin', 'traffic_admin'), async (req, res) => {
+  const { medicalPhone, firePhone } = req.body;
+  if (medicalPhone === undefined || firePhone === undefined) {
+    return res.status(400).json({ error: 'Medical and fire coordinator phone numbers are required.' });
+  }
+
+  try {
+    await db.query(
+      `INSERT INTO system_settings (setting_key, setting_value)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [EMERGENCY_CONTACT_KEYS.medicalPhone, String(medicalPhone).trim()]
+    );
+    await db.query(
+      `INSERT INTO system_settings (setting_key, setting_value)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+      [EMERGENCY_CONTACT_KEYS.firePhone, String(firePhone).trim()]
+    );
+
+    res.json({
+      message: 'Emergency coordinator contacts updated successfully.',
+      contacts: await getEmergencyContacts()
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
 // Get pending services
 app.get('/api/admin/pending-services', authenticateJWT, authorizeRoles('medical_admin', 'fire_admin', 'traffic_admin'), async (req, res) => {
   try {
@@ -365,14 +440,19 @@ app.post('/api/citizen/incidents', authenticateJWT, authorizeRoles('citizen_user
   if (!type || latitude === undefined || longitude === undefined) {
     return res.status(400).json({ error: 'Incident type, latitude, and longitude are required.' });
   }
+  const incidentType = normalizeIncidentType(type);
+  if (!isValidIncidentType(incidentType)) {
+    return res.status(400).json({ error: `Invalid incident type. Must be one of: ${INCIDENT_TYPES.join(', ')}` });
+  }
 
   try {
     // Insert incident
     const [incidentResult] = await db.query(
       'INSERT INTO incidents (type, latitude, longitude, description, source, reporter_id, status) VALUES (?, ?, ?, ?, "citizen", ?, "reported")',
-      [type, latitude, longitude, description || '', req.user.id]
+      [incidentType, latitude, longitude, description || '', req.user.id]
     );
     const incidentId = incidentResult.insertId;
+    await db.addTimelineEvent(incidentId, 'reported', `Incident reported by Citizen: ${incidentType.replace('_', ' ')}.`);
 
     const imageUrls = [];
     if (req.files && req.files.length > 0) {
@@ -476,9 +556,9 @@ app.get('/api/incidents', authenticateJWT, async (req, res) => {
     let params = [];
 
     if (req.user.role === 'medical_admin') {
-      query = 'SELECT * FROM incidents WHERE type IN ("accident", "medical_emergency") ORDER BY created_at DESC';
+      query = 'SELECT * FROM incidents WHERE type IN ("medical_emergency", "accident", "other") ORDER BY created_at DESC';
     } else if (req.user.role === 'fire_admin') {
-      query = 'SELECT * FROM incidents WHERE type IN ("fire", "gas_leak") ORDER BY created_at DESC';
+      query = 'SELECT * FROM incidents WHERE type IN ("fire", "gas_leak", "building_collapse") ORDER BY created_at DESC';
     }
 
     const [incidents] = await db.query(query, params);
@@ -575,11 +655,8 @@ app.get('/api/incidents/:id/nearby-services', authenticateJWT, async (req, res) 
     }
     const incident = incidents[0];
 
-    // Filter services type: Hospital for Accident/Medical, Fire Station for Fire/Gas leak
-    let serviceType = 'hospital';
-    if (incident.type === 'fire' || incident.type === 'gas_leak') {
-      serviceType = 'fire_station';
-    }
+    // Filter service type through the existing workflow.
+    const serviceType = getCoordinatorType(incident.type) === 'fire' ? 'fire_station' : 'hospital';
 
     const [services] = await db.query('SELECT * FROM services WHERE type = ? AND status = "active"', [serviceType]);
 
@@ -644,38 +721,55 @@ app.get('/api/incidents/:id/nearby-services', authenticateJWT, async (req, res) 
 async function calculateRoute(startLat, startLng, endLat, endLng) {
   const osrmBaseUrl = process.env.OSRM_BASE_URL || 'https://router.project-osrm.org';
   const coordinates = `${startLng},${startLat};${endLng},${endLat}`;
-  const url = `${osrmBaseUrl.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
+  const primaryUrl = `${osrmBaseUrl.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
+  const fallbackUrl = `https://routing.openstreetmap.de/routed-car/route/v1/driving/${coordinates}`;
+
+  let routeData = null;
+  let provider = 'osrm_primary';
 
   try {
-    const response = await axios.get(url, {
+    const response = await axios.get(primaryUrl, {
       params: {
         overview: 'full',
         geometries: 'geojson',
         alternatives: false,
         steps: false
       },
-      timeout: 10000
+      timeout: 6000
     });
-
-    const routeData = response.data;
-    if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
-      const route = routeData.routes[0];
-      const points = route.geometry.coordinates.map(([lng, lat]) => ({
-        lat: parseFloat(lat.toFixed(6)),
-        lng: parseFloat(lng.toFixed(6))
-      }));
-
-      return {
-        points,
-        distance: parseFloat((route.distance / 1000).toFixed(2)),
-        duration: Math.max(1, Math.ceil(route.duration / 60)),
-        provider: 'osrm'
-      };
-    }
-
-    console.warn('OSRM returned no route. Falling back to direct route.', routeData?.code || 'unknown');
+    routeData = response.data;
   } catch (err) {
-    console.warn('OSRM request failed. Falling back to direct route.', err.message);
+    console.warn(`Primary OSRM request failed: ${err.message}. Trying backup OSRM server...`);
+    try {
+      const response = await axios.get(fallbackUrl, {
+        params: {
+          overview: 'full',
+          geometries: 'geojson',
+          alternatives: false,
+          steps: false
+        },
+        timeout: 6000
+      });
+      routeData = response.data;
+      provider = 'osrm_fallback';
+    } catch (fallbackErr) {
+      console.warn(`Fallback OSRM request failed too: ${fallbackErr.message}`);
+    }
+  }
+
+  if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
+    const route = routeData.routes[0];
+    const points = route.geometry.coordinates.map(([lng, lat]) => ({
+      lat: parseFloat(lat.toFixed(6)),
+      lng: parseFloat(lng.toFixed(6))
+    }));
+
+    return {
+      points,
+      distance: parseFloat((route.distance / 1000).toFixed(2)),
+      duration: Math.max(1, Math.ceil(route.duration / 60)),
+      provider
+    };
   }
 
   const distance = getHaversineDistance(startLat, startLng, endLat, endLng);
@@ -811,6 +905,8 @@ app.post('/api/incidents/:id/alert-service', authenticateJWT, authorizeRoles('me
 
     // Update incident status
     await db.query('UPDATE incidents SET status = "service_alerted" WHERE id = ?', [incidentId]);
+    await db.addTimelineEvent(incidentId, 'service_recommended', `Service recommended: ${service.name} (${service.type}).`);
+    await db.addTimelineEvent(incidentId, 'service_assigned', `Service assigned and alerted: ${service.name}.`);
 
     const dispatchObj = {
       id: dispatchResult.insertId,
@@ -864,6 +960,53 @@ app.get('/api/services/:id/alerts', authenticateJWT, authorizeRoles('hospital_us
     for (const d of dispatches) {
       d.route_geometry = parseRouteGeometry(d.route_geometry);
       d.distance = getRouteDistanceKm(d.route_geometry);
+    }
+
+    res.json(dispatches);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get all active dispatches for service
+app.get('/api/services/:id/active-dispatches', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const serviceId = req.params.id;
+  try {
+    const [dispatches] = await db.query(
+      `SELECT d.*, 
+              i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.description as incident_description,
+              s.name as service_name, s.type as service_type, s.latitude as service_lat, s.longitude as service_lng
+       FROM dispatches d
+       JOIN incidents i ON d.incident_id = i.id
+       JOIN services s ON d.service_id = s.id
+       WHERE d.service_id = ? AND d.status IN ("dispatched", "en_route", "at_scene", "returning")`,
+      [serviceId]
+    );
+
+    for (const d of dispatches) {
+      d.route_geometry = parseRouteGeometry(d.route_geometry);
+      d.distance = getRouteDistanceKm(d.route_geometry);
+
+      const [corridors] = await db.query(
+        `SELECT status, signals_state
+         FROM green_corridors
+         WHERE dispatch_id = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [d.id]
+      );
+      d.corridor_active = corridors[0]?.status === 'active';
+      const storedSignals = corridors[0]?.signals_state;
+      if (storedSignals) {
+        try {
+          d.signals = typeof storedSignals === 'string' ? JSON.parse(storedSignals) : storedSignals;
+        } catch (e) {
+          d.signals = [];
+        }
+      } else {
+        d.signals = [];
+      }
     }
 
     res.json(dispatches);
@@ -969,6 +1112,7 @@ app.post('/api/services/:id/dispatch', authenticateJWT, authorizeRoles('hospital
     await db.query('UPDATE vehicles SET status = "dispatched" WHERE id = ?', [vehicleId]);
     // Update incident status to vehicle_dispatched
     await db.query('UPDATE incidents SET status = "vehicle_dispatched" WHERE id = ?', [dispatch.incident_id]);
+    await db.addTimelineEvent(dispatch.incident_id, 'vehicle_dispatched', `Vehicle dispatched: ${vehicleId}.`);
 
     dispatch.vehicle_id = vehicleId;
     dispatch.status = 'dispatched';
@@ -1010,6 +1154,7 @@ app.post('/api/services/:id/at-scene', authenticateJWT, authorizeRoles('hospital
     await db.query('UPDATE vehicles SET status = "at_scene" WHERE id = ?', [dispatch.vehicle_id]);
     await db.query('UPDATE incidents SET status = "at_scene" WHERE id = ?', [dispatch.incident_id]);
     await db.query('UPDATE dispatches SET status = "at_scene" WHERE id = ?', [dispatchId]);
+    await db.addTimelineEvent(dispatch.incident_id, 'at_scene', `Vehicle arrived at scene.`);
 
     // Broadcast
     io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
@@ -1024,7 +1169,7 @@ app.post('/api/services/:id/at-scene', authenticateJWT, authorizeRoles('hospital
 
 // 5. Resolve Incident
 app.post('/api/services/:id/resolve', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
-  const { dispatchId } = req.body;
+  const { dispatchId, outcome, fireSeverity, waterConsumption, timeToControl, timeToExtinguish } = req.body;
   if (!dispatchId) return res.status(400).json({ error: 'Dispatch ID is required.' });
 
   try {
@@ -1032,9 +1177,27 @@ app.post('/api/services/:id/resolve', authenticateJWT, authorizeRoles('hospital_
     if (dispatches.length === 0) return res.status(404).json({ error: 'Dispatch not found.' });
     const dispatch = dispatches[0];
 
+    // Update outcome & other fields on dispatch record
+    await db.query(
+      `UPDATE dispatches 
+       SET outcome = ?, fire_severity = ?, water_consumption = ?, time_to_control = ?, time_to_extinguish = ?
+       WHERE id = ?`,
+      [
+        outcome || null,
+        fireSeverity || null,
+        waterConsumption !== undefined ? parseInt(waterConsumption) : null,
+        timeToControl !== undefined ? parseInt(timeToControl) : null,
+        timeToExtinguish !== undefined ? parseInt(timeToExtinguish) : null,
+        dispatchId
+      ]
+    );
+
     // Update incident status to resolved
     await db.query('UPDATE incidents SET status = "resolved" WHERE id = ?', [dispatch.incident_id]);
     
+    // Add timeline event
+    await db.addTimelineEvent(dispatch.incident_id, 'resolved', `Incident resolved. Outcome: ${outcome || 'N/A'}`);
+
     // Broadcast resolved status
     io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'resolved' });
 
@@ -1093,6 +1256,444 @@ app.get('/api/traffic/tracking-history', authenticateJWT, async (req, res) => {
   try {
     const [tracking] = await db.query('SELECT * FROM vehicle_tracking ORDER BY timestamp DESC LIMIT 100');
     res.json(tracking);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Citizen profile details
+app.get('/api/citizen/profile', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
+  try {
+    const [citizens] = await db.query('SELECT * FROM citizens WHERE user_id = ?', [req.user.id]);
+    if (citizens.length === 0) return res.status(404).json({ error: 'Citizen profile not found.' });
+    
+    res.json({
+      name: citizens[0].name,
+      phone: citizens[0].phone || '',
+      emergencyContact: citizens[0].emergency_contact || '',
+      email: req.user.email
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Update Citizen profile
+app.put('/api/citizen/profile', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
+  const { name, phone, emergencyContact, email, password } = req.body;
+  if (!name || !phone || !email) {
+    return res.status(400).json({ error: 'Name, phone number, and email are required.' });
+  }
+
+  try {
+    const [existing] = await db.query('SELECT id FROM users WHERE email = ? AND id != ?', [email, req.user.id]);
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Email already in use.' });
+    }
+
+    if (password) {
+      const passwordHash = await bcrypt.hash(password, 10);
+      await db.query('UPDATE users SET email = ?, password_hash = ? WHERE id = ?', [email, passwordHash, req.user.id]);
+    } else {
+      await db.query('UPDATE users SET email = ? WHERE id = ?', [email, req.user.id]);
+    }
+
+    await db.query(
+      'UPDATE citizens SET name = ?, phone = ?, emergency_contact = ? WHERE user_id = ?',
+      [name, phone, emergencyContact || null, req.user.id]
+    );
+
+    res.json({ message: 'Profile updated successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Citizen stats
+app.get('/api/citizen/stats', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
+  try {
+    const [total] = await db.query('SELECT COUNT(*) as count FROM incidents WHERE reporter_id = ?', [req.user.id]);
+    const [active] = await db.query('SELECT COUNT(*) as count FROM incidents WHERE reporter_id = ? AND status != "resolved"', [req.user.id]);
+    const [resolved] = await db.query('SELECT COUNT(*) as count FROM incidents WHERE reporter_id = ? AND status = "resolved"', [req.user.id]);
+    
+    res.json({
+      totalIncidents: total[0].count,
+      activeIncidents: active[0].count,
+      resolvedIncidents: resolved[0].count
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Service Profile Details
+app.get('/api/services/:id/profile', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  try {
+    const [services] = await db.query('SELECT * FROM services WHERE id = ?', [req.params.id]);
+    if (services.length === 0) return res.status(404).json({ error: 'Service profile not found.' });
+    
+    const [users] = await db.query('SELECT email FROM users WHERE id = ?', [services[0].user_id]);
+    const email = users[0]?.email || '';
+
+    res.json({
+      name: services[0].name,
+      phone: services[0].phone,
+      email: email,
+      address: services[0].address,
+      latitude: services[0].latitude,
+      longitude: services[0].longitude
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Update Service Profile Settings
+app.put('/api/services/:id/profile', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const { name, phone, email, address, latitude, longitude, password } = req.body;
+  if (!name || !phone || !email || !address || latitude === undefined || longitude === undefined) {
+    return res.status(400).json({ error: 'All service profile fields are required.' });
+  }
+
+  try {
+    const [services] = await db.query('SELECT * FROM services WHERE id = ?', [req.params.id]);
+    if (services.length === 0) return res.status(404).json({ error: 'Service profile not found.' });
+    const service = services[0];
+
+    const [existing] = await db.query('SELECT id FROM users WHERE email = ? AND id != ?', [email, service.user_id]);
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Email already in use.' });
+    }
+
+    if (password) {
+      const passwordHash = await bcrypt.hash(password, 10);
+      await db.query('UPDATE users SET email = ?, password_hash = ? WHERE id = ?', [email, passwordHash, service.user_id]);
+    } else {
+      await db.query('UPDATE users SET email = ? WHERE id = ?', [email, service.user_id]);
+    }
+
+    await db.query(
+      'UPDATE services SET name = ?, phone = ?, address = ?, latitude = ?, longitude = ? WHERE id = ?',
+      [name, phone, address, latitude, longitude, req.params.id]
+    );
+
+    res.json({ message: 'Profile updated successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Service Profile Stats
+app.get('/api/services/:id/stats', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const serviceId = req.params.id;
+  try {
+    const [totalIncidents] = await db.query('SELECT COUNT(*) as count FROM dispatches WHERE service_id = ?', [serviceId]);
+    const [activeVehicles] = await db.query(
+      'SELECT COUNT(*) as count FROM vehicles WHERE service_id = ? AND status IN ("dispatched", "en_route", "at_scene", "returning")',
+      [serviceId]
+    );
+    const [availableVehicles] = await db.query(
+      'SELECT COUNT(*) as count FROM vehicles WHERE service_id = ? AND status = "available"',
+      [serviceId]
+    );
+    const [avgTimeRows] = await db.query(
+      `SELECT AVG(TIMESTAMPDIFF(SECOND, t_as.event_time, t_en.event_time)) as avg_time
+       FROM dispatches d
+       JOIN incident_timeline t_en ON d.incident_id = t_en.incident_id AND t_en.event_type = "en_route"
+       JOIN incident_timeline t_as ON d.incident_id = t_as.incident_id AND t_as.event_type = "service_assigned"
+       WHERE d.service_id = ?`,
+      [serviceId]
+    );
+
+    const avgResponseTimeSecs = Math.round(avgTimeRows[0]?.avg_time || 0);
+    const avgResponseTimeStr = avgResponseTimeSecs > 0 
+      ? `${(avgResponseTimeSecs / 60).toFixed(1)} mins` 
+      : 'N/A';
+
+    res.json({
+      totalIncidents: totalIncidents[0].count,
+      activeVehicles: activeVehicles[0].count,
+      availableVehicles: availableVehicles[0].count,
+      avgResponseTime: avgResponseTimeStr
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Elderly "Emergency Assistance" Route
+app.post('/api/incidents/emergency-assistance', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
+  const { type, latitude, longitude, accuracy } = req.body;
+  if (!type || latitude === undefined || longitude === undefined) {
+    return res.status(400).json({ error: 'Type and GPS coordinates are required.' });
+  }
+  const incidentType = normalizeIncidentType(type);
+  if (!isValidIncidentType(incidentType)) {
+    return res.status(400).json({ error: `Invalid incident type. Must be one of: ${INCIDENT_TYPES.join(', ')}` });
+  }
+
+  try {
+    const description = `Emergency assistance requested. GPS accuracy: ${accuracy || 'N/A'}m.`;
+    const [incidentResult] = await db.query(
+      `INSERT INTO incidents (type, latitude, longitude, description, source, reporter_id, status) 
+       VALUES (?, ?, ?, ?, 'emergency_assistance', ?, 'reported')`,
+      [incidentType, latitude, longitude, description, req.user.id]
+    );
+    const incidentId = incidentResult.insertId;
+
+    await db.addTimelineEvent(incidentId, 'reported', `Emergency assistance incident reported by Citizen: ${incidentType.replace('_', ' ')}.`);
+
+    const [incidents] = await db.query('SELECT * FROM incidents WHERE id = ?', [incidentId]);
+    const incidentObj = incidents[0];
+    incidentObj.images = [];
+
+    socketModule.broadcastNewIncident(incidentObj);
+    const contacts = await getEmergencyContacts();
+    const coordinatorType = getCoordinatorType(incidentType);
+
+    res.status(201).json({
+      message: 'Emergency assistance request created.',
+      incident: incidentObj,
+      incidentId,
+      coordinatorType,
+      callNumber: coordinatorType === 'fire' ? contacts.firePhone : contacts.medicalPhone
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Admin coordinates correction
+app.put('/api/incidents/:id/location', authenticateJWT, authorizeRoles('medical_admin', 'fire_admin'), async (req, res) => {
+  const incidentId = req.params.id;
+  const { latitude, longitude, reason } = req.body;
+  if (latitude === undefined || longitude === undefined || !reason) {
+    return res.status(400).json({ error: 'New coordinates and reason are required.' });
+  }
+
+  try {
+    const [incidents] = await db.query('SELECT * FROM incidents WHERE id = ?', [incidentId]);
+    if (incidents.length === 0) return res.status(404).json({ error: 'Incident not found.' });
+    const incident = incidents[0];
+
+    await db.query(
+      `INSERT INTO incident_coordinate_audit (incident_id, original_latitude, original_longitude, updated_latitude, updated_longitude, edited_by, reason_for_change) 
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [incidentId, incident.latitude, incident.longitude, latitude, longitude, req.user.id, reason]
+    );
+
+    await db.query('UPDATE incidents SET latitude = ?, longitude = ? WHERE id = ?', [latitude, longitude, incidentId]);
+
+    await db.addTimelineEvent(incidentId, 'location_corrected', `Coordinates updated by Admin. Reason: ${reason}`);
+
+    io.emit('incident_status_change', { incidentId, status: incident.status, latitude, longitude });
+
+    res.json({ message: 'Incident location updated successfully.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Admin coordinate correction log
+app.get('/api/incidents/:id/audit-trail', authenticateJWT, async (req, res) => {
+  try {
+    const [audit] = await db.query(
+      `SELECT a.*, u.email as editor_email
+       FROM incident_coordinate_audit a
+       JOIN users u ON a.edited_by = u.id
+       WHERE a.incident_id = ?
+       ORDER BY a.edited_time DESC`,
+      [req.params.id]
+    );
+    res.json(audit);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Service history
+app.get('/api/services/:id/history', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const serviceId = req.params.id;
+  const { filter, search } = req.query;
+  
+  let dateFilter = '';
+  if (filter === 'today') {
+    dateFilter = 'AND d.created_at >= CURDATE()';
+  } else if (filter === '7days') {
+    dateFilter = 'AND d.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+  } else if (filter === '30days') {
+    dateFilter = 'AND d.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)';
+  }
+
+  let searchFilter = '';
+  const params = [serviceId];
+
+  if (search) {
+    searchFilter = `AND (d.id LIKE ? OR c.name LIKE ? OR d.vehicle_id LIKE ?)`;
+    const searchVal = `%${search}%`;
+    params.push(searchVal, searchVal, searchVal);
+  }
+
+  try {
+    const query = `
+      SELECT d.*, 
+             i.type as incident_type, i.latitude as incident_lat, i.longitude as incident_lng, i.created_at as reported_time,
+             c.name as citizen_name,
+             v.driver_name
+      FROM dispatches d
+      JOIN incidents i ON d.incident_id = i.id
+      LEFT JOIN users u ON i.reporter_id = u.id
+      LEFT JOIN citizens c ON u.id = c.user_id
+      LEFT JOIN vehicles v ON d.vehicle_id = v.id
+      WHERE d.service_id = ? ${dateFilter} ${searchFilter}
+      ORDER BY d.created_at DESC
+    `;
+    
+    const [dispatches] = await db.query(query, params);
+
+    if (dispatches.length === 0) {
+      return res.json([]);
+    }
+
+    const incidentIds = dispatches.map(d => d.incident_id);
+    
+    const [timelineEvents] = await db.query(
+      `SELECT incident_id, event_type, event_time 
+       FROM incident_timeline 
+       WHERE incident_id IN (${incidentIds.join(',')})
+       ORDER BY event_time ASC`
+    );
+
+    const timelineMap = {};
+    for (const ev of timelineEvents) {
+      if (!timelineMap[ev.incident_id]) {
+        timelineMap[ev.incident_id] = {};
+      }
+      timelineMap[ev.incident_id][ev.event_type] = ev.event_time;
+    }
+
+    const history = dispatches.map(d => {
+      const t = timelineMap[d.incident_id] || {};
+      
+      const reportedTime = d.reported_time;
+      const assignedTime = d.created_at;
+      const enRouteTime = t['en_route'] || null;
+      const arrivalTime = t['at_scene'] || null;
+      const resolutionTime = t['resolved'] || t['completed'] || null;
+
+      let responseTime = 'N/A';
+      if (assignedTime && enRouteTime) {
+        const diffMs = new Date(enRouteTime) - new Date(assignedTime);
+        responseTime = `${Math.round(diffMs / 60000)} mins`;
+      }
+
+      return {
+        id: d.id,
+        incident_id: d.incident_id,
+        incident_type: d.incident_type,
+        citizen_name: d.citizen_name || 'N/A',
+        incident_lat: d.incident_lat,
+        incident_lng: d.incident_lng,
+        reported_time: reportedTime,
+        assigned_time: assignedTime,
+        ambulance_assigned: d.vehicle_id || 'N/A',
+        driver_name: d.driver_name || 'John Doe',
+        response_time: responseTime,
+        arrival_time: arrivalTime,
+        resolution_time: resolutionTime,
+        status: d.status,
+        outcome: d.outcome || 'N/A',
+        fire_severity: d.fire_severity || 'N/A',
+        water_consumption: d.water_consumption || 0,
+        time_to_control: d.time_to_control !== null ? `${d.time_to_control} mins` : 'N/A',
+        time_to_extinguish: d.time_to_extinguish !== null ? `${d.time_to_extinguish} mins` : 'N/A'
+      };
+    });
+
+    res.json(history);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Incident Timeline
+app.get('/api/incidents/:id/timeline', authenticateJWT, async (req, res) => {
+  try {
+    const [events] = await db.query(
+      'SELECT * FROM incident_timeline WHERE incident_id = ? ORDER BY event_time ASC',
+      [req.params.id]
+    );
+    res.json(events);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Get Citizen active incident tracking
+app.get('/api/citizen/active-incident/track', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
+  try {
+    const [citizens] = await db.query('SELECT * FROM citizens WHERE user_id = ?', [req.user.id]);
+    if (citizens.length === 0) return res.status(404).json({ error: 'Citizen profile not found.' });
+    
+    const [incidents] = await db.query(
+      'SELECT * FROM incidents WHERE reporter_id = ? AND status != "resolved" ORDER BY id DESC LIMIT 1',
+      [req.user.id]
+    );
+
+    if (incidents.length === 0) {
+      return res.json(null);
+    }
+    const incident = incidents[0];
+
+    const [dispatches] = await db.query(
+      `SELECT d.*, 
+              s.name as service_name, s.type as service_type, s.latitude as service_lat, s.longitude as service_lng,
+              v.status as vehicle_status, v.latitude as v_lat, v.longitude as v_lng, v.driver_name
+       FROM dispatches d
+       JOIN services s ON d.service_id = s.id
+       LEFT JOIN vehicles v ON d.vehicle_id = v.id
+       WHERE d.incident_id = ? AND d.status != "completed"
+       ORDER BY d.id DESC LIMIT 1`,
+      [incident.id]
+    );
+
+    if (dispatches.length === 0) {
+      return res.json({
+        incident,
+        dispatch: null
+      });
+    }
+
+    const dispatch = dispatches[0];
+    dispatch.route_geometry = parseRouteGeometry(dispatch.route_geometry);
+
+    const [corridors] = await db.query(
+      'SELECT status, signals_state FROM green_corridors WHERE dispatch_id = ? ORDER BY id DESC LIMIT 1',
+      [dispatch.id]
+    );
+    const corridorActive = corridors[0]?.status === 'active';
+    const signals = corridors[0]?.signals_state ? JSON.parse(corridors[0].signals_state) : [];
+
+    res.json({
+      incident,
+      dispatch: {
+        ...dispatch,
+        corridor_active: corridorActive,
+        signals
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error.' });

@@ -73,32 +73,48 @@ function toFiniteCoordinate(value) {
 
 async function calculateRoute(startLat, startLng, endLat, endLng) {
   const coordinates = `${startLng},${startLat};${endLng},${endLat}`;
-  const url = `${OSRM_BASE_URL.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
+  const primaryUrl = `${OSRM_BASE_URL.replace(/\/$/, '')}/route/v1/driving/${coordinates}`;
+  const fallbackUrl = `https://routing.openstreetmap.de/routed-car/route/v1/driving/${coordinates}`;
+
+  let routeData = null;
 
   try {
-    const response = await axios.get(url, {
+    const response = await axios.get(primaryUrl, {
       params: {
         overview: 'full',
         geometries: 'geojson',
         alternatives: false,
         steps: false
       },
-      timeout: 10000
+      timeout: 6000
     });
-
-    const routeData = response.data;
-    if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
-      return routeData.routes[0].geometry.coordinates.map(([lng, lat]) => ({
-        lat: parseFloat(lat.toFixed(6)),
-        lng: parseFloat(lng.toFixed(6))
-      }));
-    }
-
-    console.warn('OSRM returned no return route. Falling back to direct route.', routeData?.code || 'unknown');
+    routeData = response.data;
   } catch (err) {
-    console.warn('OSRM return route request failed. Falling back to direct route.', err.message);
+    console.warn(`Primary OSRM route request failed: ${err.message}. Trying backup OSRM server...`);
+    try {
+      const response = await axios.get(fallbackUrl, {
+        params: {
+          overview: 'full',
+          geometries: 'geojson',
+          alternatives: false,
+          steps: false
+        },
+        timeout: 6000
+      });
+      routeData = response.data;
+    } catch (fallbackErr) {
+      console.warn(`Fallback OSRM route request failed too: ${fallbackErr.message}`);
+    }
   }
 
+  if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
+    return routeData.routes[0].geometry.coordinates.map(([lng, lat]) => ({
+      lat: parseFloat(lat.toFixed(6)),
+      lng: parseFloat(lng.toFixed(6))
+    }));
+  }
+
+  console.warn('Both OSRM servers failed. Falling back to direct route.');
   return [
     { lat: parseFloat(startLat.toFixed(6)), lng: parseFloat(startLng.toFixed(6)) },
     { lat: parseFloat(endLat.toFixed(6)), lng: parseFloat(endLng.toFixed(6)) }
@@ -332,6 +348,11 @@ function initSocket(server) {
       console.log(`Socket ${socket.id} joined role room: ${role}`);
     });
 
+    socket.on('join_dispatch', (dispatchId) => {
+      socket.join(`dispatch_${dispatchId}`);
+      console.log(`Socket ${socket.id} joined room: dispatch_${dispatchId}`);
+    });
+
     socket.on('disconnect', () => {
       console.log(`Socket client disconnected: ${socket.id}`);
     });
@@ -347,9 +368,9 @@ function getIo() {
 // Socket emitter helper functions
 function broadcastNewIncident(incident) {
   if (!io) return;
-  if (incident.type === 'accident' || incident.type === 'medical_emergency') {
+  if (incident.type === 'accident' || incident.type === 'medical_emergency' || incident.type === 'other') {
     io.to('medical_admin').emit('new_incident', incident);
-  } else if (incident.type === 'fire' || incident.type === 'gas_leak') {
+  } else if (incident.type === 'fire' || incident.type === 'gas_leak' || incident.type === 'building_collapse') {
     io.to('fire_admin').emit('new_incident', incident);
   }
   io.to('citizen_user').emit('incident_status_change', { incidentId: incident.id, status: incident.status });
@@ -403,13 +424,34 @@ async function startTrackingSimulation(dispatchId) {
     if (dispatches.length === 0) return;
     const dispatch = dispatches[0];
 
-    // Parse route geometry
+    // Calculate a fresh route from the service location to the incident location.
+    // This ensures a correct road route is used and stored in the database.
+    const startLat = toFiniteCoordinate(dispatch.s_lat);
+    const startLng = toFiniteCoordinate(dispatch.s_lng);
+    const endLat = toFiniteCoordinate(dispatch.i_lat);
+    const endLng = toFiniteCoordinate(dispatch.i_lng);
+
     let route = [];
-    try {
-      route = JSON.parse(dispatch.route_geometry);
-    } catch (e) {
-      console.error('Failed to parse route geometry', e);
-      return;
+    if (startLat !== null && startLng !== null && endLat !== null && endLng !== null) {
+      try {
+        route = await calculateRoute(startLat, startLng, endLat, endLng);
+        // Save the freshly calculated route to the database
+        await db.query(
+          'UPDATE dispatches SET route_geometry = ? WHERE id = ?',
+          [JSON.stringify(route), dispatchId]
+        );
+      } catch (err) {
+        console.warn('Failed to calculate fresh OSRM route for dispatch, using fallback:', err.message);
+      }
+    }
+
+    if (!route || route.length === 0) {
+      try {
+        route = JSON.parse(dispatch.route_geometry);
+      } catch (e) {
+        console.error('Failed to parse route geometry from DB:', e);
+        return;
+      }
     }
 
     if (!route || route.length === 0) return;
@@ -418,6 +460,9 @@ async function startTrackingSimulation(dispatchId) {
     await db.query('UPDATE vehicles SET status = "en_route" WHERE id = ?', [dispatch.vehicle_id]);
     await db.query('UPDATE incidents SET status = "en_route" WHERE id = ?', [dispatch.incident_id]);
     await db.query('UPDATE dispatches SET status = "en_route" WHERE id = ?', [dispatchId]);
+
+    // Log timeline event
+    await db.addTimelineEvent(dispatch.incident_id, 'en_route', `Vehicle ${dispatch.vehicle_id} dispatched and is en route to scene.`);
 
     // Insert green corridor record
     const [corridorResult] = await db.query(
@@ -435,9 +480,7 @@ async function startTrackingSimulation(dispatchId) {
     await db.query('UPDATE green_corridors SET signals_state = ? WHERE id = ?', [JSON.stringify(signals), corridorId]);
 
     // Broadcast initial state
-    io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
-    io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
-    io.emit('green_corridor_update', {
+    const initialGCUpdate = {
       dispatchId,
       incidentType: dispatch.i_type,
       serviceType: dispatch.s_type,
@@ -445,15 +488,24 @@ async function startTrackingSimulation(dispatchId) {
       status: 'active',
       signals,
       route
-    });
-    io.emit('vehicle_tracking_update', {
+    };
+    const initialTrackingUpdate = {
       vehicleId: dispatch.vehicle_id,
       latitude: route[0].lat,
       longitude: route[0].lng,
       status: 'en_route',
       progress: 0,
       dispatchId
-    });
+    };
+
+    io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
+    io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
+    io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
+    io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
+    io.emit('green_corridor_update', initialGCUpdate);
+    io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', initialGCUpdate);
+    io.emit('vehicle_tracking_update', initialTrackingUpdate);
+    io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', initialTrackingUpdate);
 
     let vehicleDistance = 0;
     const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
@@ -476,15 +528,15 @@ async function startTrackingSimulation(dispatchId) {
       );
       
       // Broadcast vehicle location and corridor state
-      io.emit('vehicle_tracking_update', {
+      const trackingUpdateData = {
         vehicleId: dispatch.vehicle_id,
         latitude: pt.lat,
         longitude: pt.lng,
         status: 'en_route',
         progress,
         dispatchId
-      });
-      io.emit('green_corridor_update', {
+      };
+      const greenUpdateData = {
         dispatchId,
         incidentType: dispatch.i_type,
         serviceType: dispatch.s_type,
@@ -492,7 +544,12 @@ async function startTrackingSimulation(dispatchId) {
         status: 'active',
         signals,
         route
-      });
+      };
+
+      io.emit('vehicle_tracking_update', trackingUpdateData);
+      io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingUpdateData);
+      io.emit('green_corridor_update', greenUpdateData);
+      io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', greenUpdateData);
 
       // If reached destination
       if (vehicleDistance >= totalRouteDistance) {
@@ -504,11 +561,11 @@ async function startTrackingSimulation(dispatchId) {
         await db.query('UPDATE incidents SET status = "at_scene" WHERE id = ?', [dispatch.incident_id]);
         await db.query('UPDATE dispatches SET status = "at_scene" WHERE id = ?', [dispatchId]);
         await db.query('UPDATE green_corridors SET status = "inactive" WHERE id = ?', [corridorId]);
+        
+        // Log timeline event
+        await db.addTimelineEvent(dispatch.incident_id, 'at_scene', `Vehicle ${dispatch.vehicle_id} arrived at scene.`);
 
-        // Broadcast destination reached
-        io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
-        io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
-        io.emit('green_corridor_update', {
+        const gcInactive = {
           dispatchId,
           incidentType: dispatch.i_type,
           serviceType: dispatch.s_type,
@@ -516,7 +573,15 @@ async function startTrackingSimulation(dispatchId) {
           status: 'inactive',
           signals: [],
           route: []
-        });
+        };
+
+        // Broadcast destination reached
+        io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
+        io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
+        io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
+        io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
+        io.emit('green_corridor_update', gcInactive);
+        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', gcInactive);
       }
     }, VEHICLE_TRACKING_INTERVAL_MS);
 
@@ -571,8 +636,16 @@ async function startReturnSimulation(dispatchId) {
       'UPDATE dispatches SET status = "returning", route_geometry = ? WHERE id = ?',
       [JSON.stringify(returnRoute), dispatchId]
     );
+
+    // Log timeline event
+    await db.addTimelineEvent(dispatch.incident_id, 'returning', `Vehicle ${dispatch.vehicle_id} is returning to station.`);
     
     io.emit('vehicle_status_change', {
+      vehicleId: dispatch.vehicle_id,
+      status: 'returning',
+      route: returnRoute
+    });
+    io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', {
       vehicleId: dispatch.vehicle_id,
       status: 'returning',
       route: returnRoute
@@ -594,7 +667,7 @@ async function startReturnSimulation(dispatchId) {
         [JSON.stringify(returnSignals), returnCorridorId]
       );
 
-      io.emit('green_corridor_update', {
+      const returnGCUpdate = {
         dispatchId,
         incidentType: dispatch.i_type,
         serviceType: dispatch.s_type,
@@ -603,7 +676,10 @@ async function startReturnSimulation(dispatchId) {
         phase: 'returning',
         signals: returnSignals,
         route: returnRoute
-      });
+      };
+
+      io.emit('green_corridor_update', returnGCUpdate);
+      io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdate);
     }
 
     let vehicleDistance = 0;
@@ -619,14 +695,17 @@ async function startReturnSimulation(dispatchId) {
       await db.query('UPDATE vehicles SET latitude = ?, longitude = ? WHERE id = ?', [pt.lat, pt.lng, dispatch.vehicle_id]);
       await db.query('INSERT INTO vehicle_tracking (vehicle_id, latitude, longitude) VALUES (?, ?, ?)', [dispatch.vehicle_id, pt.lat, pt.lng]);
 
-      io.emit('vehicle_tracking_update', {
+      const trackingReturnData = {
         vehicleId: dispatch.vehicle_id,
         latitude: pt.lat,
         longitude: pt.lng,
         status: 'returning',
         progress,
         dispatchId
-      });
+      };
+
+      io.emit('vehicle_tracking_update', trackingReturnData);
+      io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingReturnData);
 
       if (isAmbulance && returnCorridorId) {
         returnSignals = updateSignalStates(returnSignals, vehicleDistance);
@@ -635,7 +714,7 @@ async function startReturnSimulation(dispatchId) {
           [JSON.stringify(returnSignals), returnCorridorId]
         );
 
-        io.emit('green_corridor_update', {
+        const returnGCUpdateLoop = {
           dispatchId,
           incidentType: dispatch.i_type,
           serviceType: dispatch.s_type,
@@ -644,7 +723,10 @@ async function startReturnSimulation(dispatchId) {
           phase: 'returning',
           signals: returnSignals,
           route: returnRoute
-        });
+        };
+
+        io.emit('green_corridor_update', returnGCUpdateLoop);
+        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdateLoop);
       }
 
       if (vehicleDistance >= totalRouteDistance) {
@@ -658,9 +740,14 @@ async function startReturnSimulation(dispatchId) {
           await db.query('UPDATE green_corridors SET status = "inactive" WHERE id = ?', [returnCorridorId]);
         }
 
+        // Log timeline event
+        await db.addTimelineEvent(dispatch.incident_id, 'completed', `Vehicle ${dispatch.vehicle_id} return completed and is back at station.`);
+
         io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+        io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+        
         if (isAmbulance) {
-          io.emit('green_corridor_update', {
+          const returnGCInactive = {
             dispatchId,
             incidentType: dispatch.i_type,
             serviceType: dispatch.s_type,
@@ -669,7 +756,9 @@ async function startReturnSimulation(dispatchId) {
             phase: 'returning',
             signals: [],
             route: []
-          });
+          };
+          io.emit('green_corridor_update', returnGCInactive);
+          io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCInactive);
         }
       }
     }, VEHICLE_TRACKING_INTERVAL_MS);

@@ -54,6 +54,8 @@ async function createTables() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       user_id INT NOT NULL,
       name VARCHAR(255) NOT NULL,
+      phone VARCHAR(20) DEFAULT NULL,
+      emergency_contact VARCHAR(20) DEFAULT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`,
 
@@ -86,11 +88,11 @@ async function createTables() {
     // Incidents table
     `CREATE TABLE IF NOT EXISTS incidents (
       id INT AUTO_INCREMENT PRIMARY KEY,
-      type ENUM('accident', 'fire', 'gas_leak', 'medical_emergency') NOT NULL,
+      type VARCHAR(50) NOT NULL,
       latitude DECIMAL(10, 8) NOT NULL,
       longitude DECIMAL(11, 8) NOT NULL,
       description TEXT,
-      source ENUM('citizen', 'sensor') NOT NULL,
+      source VARCHAR(50) NOT NULL,
       reporter_id INT NULL,
       status ENUM('reported', 'verified', 'service_alerted', 'vehicle_dispatched', 'en_route', 'at_scene', 'resolved') DEFAULT 'reported',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -150,6 +152,38 @@ async function createTables() {
       is_read BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )`,
+
+    // Incident timeline table
+    `CREATE TABLE IF NOT EXISTS incident_timeline (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      incident_id INT NOT NULL,
+      event_type VARCHAR(100) NOT NULL,
+      event_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      description TEXT NOT NULL,
+      FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
+    )`,
+
+    // Incident coordinate audit table
+    `CREATE TABLE IF NOT EXISTS incident_coordinate_audit (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      incident_id INT NOT NULL,
+      original_latitude DECIMAL(10, 8) NOT NULL,
+      original_longitude DECIMAL(11, 8) NOT NULL,
+      updated_latitude DECIMAL(10, 8) NOT NULL,
+      updated_longitude DECIMAL(11, 8) NOT NULL,
+      edited_by INT NOT NULL,
+      edited_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      reason_for_change TEXT NOT NULL,
+      FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE,
+      FOREIGN KEY (edited_by) REFERENCES users(id) ON DELETE CASCADE
+    )`,
+
+    // System settings table
+    `CREATE TABLE IF NOT EXISTS system_settings (
+      setting_key VARCHAR(100) PRIMARY KEY,
+      setting_value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   ];
 
@@ -162,7 +196,58 @@ async function createTables() {
       throw err;
     }
   }
+
+  // Database migrations - dynamically adding columns if not exists
+  const addColumnIfNotExists = async (table, column, definition) => {
+    const [rows] = await pool.query(
+      `SELECT * FROM information_schema.COLUMNS 
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+      [dbName, table, column]
+    );
+    if (rows.length === 0) {
+      await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+      console.log(`Added column ${column} to table ${table}`);
+    }
+  };
+
+  try {
+    await addColumnIfNotExists('citizens', 'phone', 'VARCHAR(20) DEFAULT NULL');
+    await addColumnIfNotExists('citizens', 'emergency_contact', 'VARCHAR(20) DEFAULT NULL');
+    await addColumnIfNotExists('dispatches', 'outcome', 'VARCHAR(100) DEFAULT NULL');
+    await addColumnIfNotExists('dispatches', 'fire_severity', 'VARCHAR(50) DEFAULT NULL');
+    await addColumnIfNotExists('dispatches', 'water_consumption', 'INT DEFAULT NULL');
+    await addColumnIfNotExists('dispatches', 'time_to_control', 'INT DEFAULT NULL');
+    await addColumnIfNotExists('dispatches', 'time_to_extinguish', 'INT DEFAULT NULL');
+    await addColumnIfNotExists('vehicles', 'driver_name', 'VARCHAR(100) DEFAULT NULL');
+
+    // Modify incident columns to avoid ENUM constraints as categories and sources grow.
+    await pool.query(`ALTER TABLE incidents MODIFY COLUMN type VARCHAR(50) NOT NULL`);
+    await pool.query(`ALTER TABLE incidents MODIFY COLUMN source VARCHAR(50) NOT NULL`);
+
+    // Modify status columns to avoid ENUM constraints
+    await pool.query(`ALTER TABLE incidents MODIFY COLUMN status VARCHAR(50) DEFAULT 'reported'`);
+    await pool.query(`ALTER TABLE dispatches MODIFY COLUMN status VARCHAR(50) DEFAULT 'awaiting_response'`);
+
+    await seedSystemSettings();
+    console.log('Database migrations completed successfully.');
+  } catch (migErr) {
+    console.error('Migration error:', migErr);
+  }
   console.log('Database schema checked/created successfully.');
+}
+
+async function seedSystemSettings() {
+  const defaults = {
+    medical_emergency_coordinator_phone: process.env.MEDICAL_EMERGENCY_COORDINATOR_PHONE || '',
+    fire_emergency_coordinator_phone: process.env.FIRE_EMERGENCY_COORDINATOR_PHONE || ''
+  };
+
+  for (const [key, value] of Object.entries(defaults)) {
+    await pool.query(
+      'INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES (?, ?)',
+      [key, value]
+    );
+  }
 }
 
 async function seedAdmins() {
@@ -195,8 +280,25 @@ async function seedAdmins() {
   }
 }
 
+async function addTimelineEvent(incidentId, eventType, description) {
+  try {
+    await pool.query(
+      'INSERT INTO incident_timeline (incident_id, event_type, description) VALUES (?, ?, ?)',
+      [incidentId, eventType, description]
+    );
+    const socketModule = require('./socket');
+    const io = socketModule.getIo();
+    if (io) {
+      io.emit('timeline_update', { incidentId, eventType, description, timestamp: new Date() });
+    }
+  } catch (err) {
+    console.error('Error adding timeline event:', err);
+  }
+}
+
 module.exports = {
   initDB,
   query: (sql, params) => pool.query(sql, params),
-  getPool: () => pool
+  getPool: () => pool,
+  addTimelineEvent
 };

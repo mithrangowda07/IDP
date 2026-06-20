@@ -173,8 +173,10 @@ export default function MapPanel({
     if (incident.type === 'medical_emergency') color = '#3b82f6'; // light blue
     if (incident.type === 'fire') color = '#ef4444'; // red
     if (incident.type === 'gas_leak') color = '#f59e0b'; // orange
+    if (incident.type === 'building_collapse') color = '#a855f7'; // purple
+    if (incident.type === 'other') color = '#64748b'; // slate
 
-    const label = incident.type.charAt(0).toUpperCase();
+    const label = incident.type === 'building_collapse' ? 'BC' : incident.type.charAt(0).toUpperCase();
     return createCustomIcon(color, label, isSelected || incident.status !== 'resolved');
   };
 
@@ -238,7 +240,7 @@ export default function MapPanel({
       >
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-          url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
         />
 
         {/* Map Click Handler for Citizen manual location */}
@@ -268,10 +270,11 @@ export default function MapPanel({
           >
             <Popup>
               <div className="text-slate-900 p-1">
-                <h4 className="font-bold text-xs uppercase text-slate-800">{incident.type.replace('_', ' ')}</h4>
+                <h4 className="font-bold text-xs uppercase text-slate-800">{incident.type.replaceAll('_', ' ')}</h4>
                 <p className="text-[10px] text-slate-500 mt-0.5">Status: <strong className="text-blue-600">{incident.status}</strong></p>
                 <p className="text-[11px] text-slate-700 mt-1 max-w-[150px] truncate">{incident.description || 'No description'}</p>
                 {incident.source === 'sensor' && <span className="inline-block mt-1 bg-red-100 text-red-800 text-[9px] px-1 rounded font-bold">IoT Sensor</span>}
+                {incident.source === 'emergency_assistance' && <span className="inline-block mt-1 bg-rose-100 text-rose-800 text-[9px] px-1 rounded font-bold">Emergency Assistance</span>}
               </div>
             </Popup>
           </Marker>

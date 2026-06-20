@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import { authAPI } from '../services/api';
-import { User, Mail, Lock, ArrowLeft } from 'lucide-react';
+import { User, Mail, Lock, ArrowLeft, Phone, ShieldAlert } from 'lucide-react';
 
 export default function RegisterCitizen({ navigate }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [phone, setPhone] = useState('');
+  const [emergencyContact, setEmergencyContact] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -16,11 +18,13 @@ export default function RegisterCitizen({ navigate }) {
     setSuccess('');
     setLoading(true);
     try {
-      await authAPI.registerCitizen(name, email, password);
+      await authAPI.registerCitizen({ name, email, password, phone, emergencyContact });
       setSuccess('Registration successful! Redirecting to login...');
       setName('');
       setEmail('');
       setPassword('');
+      setPhone('');
+      setEmergencyContact('');
       setTimeout(() => navigate('login'), 2500);
     } catch (err) {
       setError(err.response?.data?.error || 'Citizen registration failed.');
@@ -89,6 +93,39 @@ export default function RegisterCitizen({ navigate }) {
                 onChange={(e) => setEmail(e.target.value)}
                 className="w-full pl-10 pr-4 py-3 rounded-xl glass-input text-white focus:border-blue-500"
                 placeholder="johndoe@example.com"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Phone Number</label>
+            <div className="relative">
+              <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">
+                <Phone size={18} />
+              </span>
+              <input
+                type="tel"
+                required
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                className="w-full pl-10 pr-4 py-3 rounded-xl glass-input text-white focus:border-blue-500"
+                placeholder="+1 555-0199"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Emergency Contact (Optional)</label>
+            <div className="relative">
+              <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">
+                <ShieldAlert size={18} />
+              </span>
+              <input
+                type="tel"
+                value={emergencyContact}
+                onChange={(e) => setEmergencyContact(e.target.value)}
+                className="w-full pl-10 pr-4 py-3 rounded-xl glass-input text-white focus:border-blue-500"
+                placeholder="+1 555-0122"
               />
             </div>
           </div>
