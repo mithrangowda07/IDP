@@ -1,3 +1,6 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
@@ -610,16 +613,7 @@ app.get('/api/incidents/:id', authenticateJWT, async (req, res) => {
         [incident.dispatch.id]
       );
       incident.dispatch.corridor_active = corridors[0]?.status === 'active';
-      const storedSignals = corridors[0]?.signals_state;
-      if (Array.isArray(storedSignals)) {
-        incident.dispatch.signals = storedSignals;
-      } else {
-        try {
-          incident.dispatch.signals = storedSignals ? JSON.parse(storedSignals) : [];
-        } catch (e) {
-          incident.dispatch.signals = [];
-        }
-      }
+      incident.dispatch.signals = parseSignalsState(corridors[0]?.signals_state);
     }
 
     res.json(incident);
@@ -726,34 +720,45 @@ async function calculateRoute(startLat, startLng, endLat, endLng) {
 
   let routeData = null;
   let provider = 'osrm_primary';
+  const maxRetries = 3;
 
-  try {
-    const response = await axios.get(primaryUrl, {
-      params: {
-        overview: 'full',
-        geometries: 'geojson',
-        alternatives: false,
-        steps: false
-      },
-      timeout: 6000
-    });
-    routeData = response.data;
-  } catch (err) {
-    console.warn(`Primary OSRM request failed: ${err.message}. Trying backup OSRM server...`);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const response = await axios.get(fallbackUrl, {
+      const response = await axios.get(primaryUrl, {
         params: {
           overview: 'full',
           geometries: 'geojson',
           alternatives: false,
           steps: false
         },
-        timeout: 6000
+        timeout: 10000 // 10 seconds timeout
       });
       routeData = response.data;
-      provider = 'osrm_fallback';
-    } catch (fallbackErr) {
-      console.warn(`Fallback OSRM request failed too: ${fallbackErr.message}`);
+      provider = 'osrm_primary';
+      break; // Success
+    } catch (err) {
+      console.warn(`Primary OSRM request attempt ${attempt} failed: ${err.message || err.code || 'Timeout'}. Trying fallback...`);
+      try {
+        const response = await axios.get(fallbackUrl, {
+          params: {
+            overview: 'full',
+            geometries: 'geojson',
+            alternatives: false,
+            steps: false
+          },
+          timeout: 10000
+        });
+        routeData = response.data;
+        provider = 'osrm_fallback';
+        break; // Success
+      } catch (fallbackErr) {
+        console.warn(`Fallback OSRM request attempt ${attempt} failed: ${fallbackErr.message || fallbackErr.code || 'Timeout'}`);
+      }
+    }
+
+    if (attempt < maxRetries) {
+      // Wait 500ms before retrying
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
 
@@ -800,6 +805,17 @@ function parseRouteGeometry(routeGeometry) {
 
   try {
     const parsed = JSON.parse(routeGeometry);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function parseSignalsState(signalsState) {
+  if (Array.isArray(signalsState)) return signalsState;
+  if (!signalsState) return [];
+  try {
+    const parsed = typeof signalsState === 'string' ? JSON.parse(signalsState) : signalsState;
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
@@ -997,16 +1013,7 @@ app.get('/api/services/:id/active-dispatches', authenticateJWT, authorizeRoles('
         [d.id]
       );
       d.corridor_active = corridors[0]?.status === 'active';
-      const storedSignals = corridors[0]?.signals_state;
-      if (storedSignals) {
-        try {
-          d.signals = typeof storedSignals === 'string' ? JSON.parse(storedSignals) : storedSignals;
-        } catch (e) {
-          d.signals = [];
-        }
-      } else {
-        d.signals = [];
-      }
+      d.signals = parseSignalsState(corridors[0]?.signals_state);
     }
 
     res.json(dispatches);
@@ -1045,16 +1052,7 @@ app.get('/api/services/:id/active-dispatch', authenticateJWT, authorizeRoles('ho
         [d.id]
       );
       d.corridor_active = corridors[0]?.status === 'active';
-      const storedSignals = corridors[0]?.signals_state;
-      if (Array.isArray(storedSignals)) {
-        d.signals = storedSignals;
-      } else {
-        try {
-          d.signals = storedSignals ? JSON.parse(storedSignals) : [];
-        } catch (e) {
-          d.signals = [];
-        }
-      }
+      d.signals = parseSignalsState(corridors[0]?.signals_state);
 
       return res.json(d);
     }
@@ -1073,6 +1071,93 @@ app.get('/api/services/:id/vehicles', authenticateJWT, async (req, res) => {
     res.json(vehicles);
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Add vehicle to service fleet
+app.post('/api/services/:id/vehicles', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const serviceId = req.params.id;
+  const { vehicleId } = req.body;
+
+  if (!vehicleId || !String(vehicleId).trim()) {
+    return res.status(400).json({ error: 'Vehicle ID is required.' });
+  }
+
+  const trimmedId = String(vehicleId).trim().toUpperCase();
+
+  try {
+    const [services] = await db.query(
+      'SELECT * FROM services WHERE id = ? AND user_id = ?',
+      [serviceId, req.user.id]
+    );
+    if (services.length === 0) {
+      return res.status(403).json({ error: 'Access denied: you can only manage your own fleet.' });
+    }
+    const service = services[0];
+
+    const vehicleType = service.type === 'fire_station' ? 'fire_engine' : 'ambulance';
+    const expectedPrefix = vehicleType === 'fire_engine' ? 'FIRE-' : 'AMB-';
+    if (!trimmedId.startsWith(expectedPrefix)) {
+      return res.status(400).json({ error: `Vehicle ID must start with ${expectedPrefix}` });
+    }
+
+    const [existing] = await db.query('SELECT id FROM vehicles WHERE id = ?', [trimmedId]);
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Vehicle ID already exists in the system.' });
+    }
+
+    await db.query(
+      'INSERT INTO vehicles (id, service_id, type, status, latitude, longitude) VALUES (?, ?, ?, "available", ?, ?)',
+      [trimmedId, serviceId, vehicleType, service.latitude, service.longitude]
+    );
+
+    const [vehicles] = await db.query('SELECT * FROM vehicles WHERE service_id = ? ORDER BY id', [serviceId]);
+    res.status(201).json({ message: 'Vehicle added to fleet.', vehicleId: trimmedId, vehicles });
+  } catch (err) {
+    console.error('Add vehicle error:', err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Remove vehicle from service fleet
+app.delete('/api/services/:id/vehicles/:vehicleId', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
+  const serviceId = req.params.id;
+  const vehicleId = decodeURIComponent(req.params.vehicleId).trim().toUpperCase();
+
+  try {
+    const [services] = await db.query(
+      'SELECT id FROM services WHERE id = ? AND user_id = ?',
+      [serviceId, req.user.id]
+    );
+    if (services.length === 0) {
+      return res.status(403).json({ error: 'Access denied: you can only manage your own fleet.' });
+    }
+
+    const [vehicles] = await db.query('SELECT * FROM vehicles WHERE id = ? AND service_id = ?', [vehicleId, serviceId]);
+    if (vehicles.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found in this fleet.' });
+    }
+
+    const vehicle = vehicles[0];
+    if (!['available', 'maintenance'].includes(vehicle.status)) {
+      return res.status(400).json({ error: 'Cannot remove a vehicle that is currently on an active dispatch.' });
+    }
+
+    const [activeDispatches] = await db.query(
+      'SELECT id FROM dispatches WHERE vehicle_id = ? AND status IN ("dispatched", "en_route", "at_scene", "returning")',
+      [vehicleId]
+    );
+    if (activeDispatches.length > 0) {
+      return res.status(400).json({ error: 'Cannot remove a vehicle linked to an active dispatch.' });
+    }
+
+    await db.query('DELETE FROM vehicles WHERE id = ? AND service_id = ?', [vehicleId, serviceId]);
+
+    const [remaining] = await db.query('SELECT * FROM vehicles WHERE service_id = ? ORDER BY id', [serviceId]);
+    res.json({ message: 'Vehicle removed from fleet.', vehicles: remaining });
+  } catch (err) {
+    console.error('Remove vehicle error:', err);
     res.status(500).json({ error: 'Internal server error.' });
   }
 });
@@ -1151,6 +1236,8 @@ app.post('/api/services/:id/at-scene', authenticateJWT, authorizeRoles('hospital
     if (dispatches.length === 0) return res.status(404).json({ error: 'Dispatch not found.' });
     const dispatch = dispatches[0];
 
+    await socketModule.stopTrackingSimulation(dispatchId);
+
     await db.query('UPDATE vehicles SET status = "at_scene" WHERE id = ?', [dispatch.vehicle_id]);
     await db.query('UPDATE incidents SET status = "at_scene" WHERE id = ?', [dispatch.incident_id]);
     await db.query('UPDATE dispatches SET status = "at_scene" WHERE id = ?', [dispatchId]);
@@ -1169,7 +1256,7 @@ app.post('/api/services/:id/at-scene', authenticateJWT, authorizeRoles('hospital
 
 // 5. Resolve Incident
 app.post('/api/services/:id/resolve', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), async (req, res) => {
-  const { dispatchId, outcome, fireSeverity, waterConsumption, timeToControl, timeToExtinguish } = req.body;
+  const { dispatchId, outcome, fireSeverity, waterConsumption, timeToControl, timeToExtinguish, needGreenCorridor } = req.body;
   if (!dispatchId) return res.status(400).json({ error: 'Dispatch ID is required.' });
 
   try {
@@ -1201,8 +1288,9 @@ app.post('/api/services/:id/resolve', authenticateJWT, authorizeRoles('hospital_
     // Broadcast resolved status
     io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'resolved' });
 
-    // Trigger return simulation
-    await socketModule.startReturnSimulation(dispatchId);
+    // Trigger return simulation with needGreenCorridor preference
+    const requestGreenCorridor = needGreenCorridor !== false; // default to true if not defined
+    await socketModule.startReturnSimulation(dispatchId, requestGreenCorridor);
 
     res.json({ message: 'Incident resolved. Vehicle returning to station.' });
   } catch (err) {
@@ -1237,11 +1325,7 @@ app.get('/api/traffic/active-corridors', authenticateJWT, async (req, res) => {
       } catch (e) {
         gc.route_geometry = [];
       }
-      try {
-        gc.signals_state = JSON.parse(gc.signals_state);
-      } catch (e) {
-        gc.signals_state = [];
-      }
+      gc.signals_state = parseSignalsState(gc.signals_state);
     }
 
     res.json(corridors);
@@ -1648,7 +1732,10 @@ app.get('/api/citizen/active-incident/track', authenticateJWT, authorizeRoles('c
     if (citizens.length === 0) return res.status(404).json({ error: 'Citizen profile not found.' });
     
     const [incidents] = await db.query(
-      'SELECT * FROM incidents WHERE reporter_id = ? AND status != "resolved" ORDER BY id DESC LIMIT 1',
+      `SELECT i.* FROM incidents i
+       LEFT JOIN dispatches d ON d.incident_id = i.id
+       WHERE i.reporter_id = ? AND (i.status != "resolved" OR (i.status = "resolved" AND d.status = "returning"))
+       ORDER BY i.id DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -1684,7 +1771,7 @@ app.get('/api/citizen/active-incident/track', authenticateJWT, authorizeRoles('c
       [dispatch.id]
     );
     const corridorActive = corridors[0]?.status === 'active';
-    const signals = corridors[0]?.signals_state ? JSON.parse(corridors[0].signals_state) : [];
+    const signals = parseSignalsState(corridors[0]?.signals_state);
 
     res.json({
       incident,

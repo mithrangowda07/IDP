@@ -184,6 +184,14 @@ async function createTables() {
       setting_key VARCHAR(100) PRIMARY KEY,
       setting_value TEXT NOT NULL,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+
+    // OSM Traffic Signals Cache table
+    `CREATE TABLE IF NOT EXISTS osm_traffic_signals (
+      osm_id BIGINT PRIMARY KEY,
+      latitude DECIMAL(10, 8) NOT NULL,
+      longitude DECIMAL(11, 8) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 

@@ -1,3 +1,6 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const socketIo = require('socket.io');
 const axios = require('axios');
 const db = require('./db');
@@ -6,13 +9,27 @@ let io;
 const activeSimulations = {}; // dispatchId -> intervalInfo
 const SIGNAL_CLEARANCE_DISTANCE_METERS = 500;
 const SIGNAL_PASSED_PERSIST_DISTANCE_METERS = 60;
-const SIGNAL_ROUTE_MATCH_DISTANCE_METERS = parseInt(process.env.SIGNAL_ROUTE_MATCH_DISTANCE_METERS || '0', 10);
+const SIGNAL_ROUTE_MATCH_DISTANCE_METERS = parseInt(process.env.SIGNAL_ROUTE_MATCH_DISTANCE_METERS || '75', 10);
 const SIGNAL_DEDUPE_DISTANCE_METERS = 75;
 const VEHICLE_STEP_DISTANCE_METERS = 25;
 const VEHICLE_TRACKING_INTERVAL_MS = 1000;
-const OVERPASS_API_URL = process.env.OVERPASS_API_URL || 'https://overpass-api.de/api/interpreter';
-const USE_SYNTHETIC_SIGNAL_FALLBACK = process.env.USE_SYNTHETIC_SIGNAL_FALLBACK === 'true';
+const PRIMARY_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.openstreetmap.fr/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter'
+];
+const FALLBACK_ENDPOINTS = [
+  'https://z.overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.osm.ch/api/interpreter',
+  'https://overpass.openstreetmap.ru/api/interpreter'
+];
 const OSRM_BASE_URL = process.env.OSRM_BASE_URL || 'https://router.project-osrm.org';
+const GREEN_CORRIDOR_VEHICLE_TYPES = new Set(['ambulance', 'fire_engine']);
+
+function supportsGreenCorridor(vehicleType) {
+  return GREEN_CORRIDOR_VEHICLE_TYPES.has(vehicleType);
+}
 
 function getDistanceMeters(a, b) {
   const earthRadiusMeters = 6371000;
@@ -77,76 +94,56 @@ async function calculateRoute(startLat, startLng, endLat, endLng) {
   const fallbackUrl = `https://routing.openstreetmap.de/routed-car/route/v1/driving/${coordinates}`;
 
   let routeData = null;
+  const maxRetries = 3;
 
-  try {
-    const response = await axios.get(primaryUrl, {
-      params: {
-        overview: 'full',
-        geometries: 'geojson',
-        alternatives: false,
-        steps: false
-      },
-      timeout: 6000
-    });
-    routeData = response.data;
-  } catch (err) {
-    console.warn(`Primary OSRM route request failed: ${err.message}. Trying backup OSRM server...`);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const response = await axios.get(fallbackUrl, {
+      const response = await axios.get(primaryUrl, {
         params: {
           overview: 'full',
           geometries: 'geojson',
           alternatives: false,
           steps: false
         },
-        timeout: 6000
+        timeout: 10000 // 10 seconds timeout
       });
       routeData = response.data;
-    } catch (fallbackErr) {
-      console.warn(`Fallback OSRM route request failed too: ${fallbackErr.message}`);
+      break; // Success
+    } catch (err) {
+      console.warn(`Primary OSRM route request attempt ${attempt} failed: ${err.message || err.code || 'Timeout'}. Trying fallback...`);
+      try {
+        const response = await axios.get(fallbackUrl, {
+          params: {
+            overview: 'full',
+            geometries: 'geojson',
+            alternatives: false,
+            steps: false
+          },
+          timeout: 10000
+        });
+        routeData = response.data;
+        break; // Success
+      } catch (fallbackErr) {
+        console.warn(`Fallback OSRM route request attempt ${attempt} failed: ${fallbackErr.message || fallbackErr.code || 'Timeout'}`);
+      }
+    }
+
+    if (attempt < maxRetries) {
+      // Wait 500ms before retrying
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
 
-  if (routeData?.code === 'Ok' && routeData.routes?.length > 0) {
-    return routeData.routes[0].geometry.coordinates.map(([lng, lat]) => ({
-      lat: parseFloat(lat.toFixed(6)),
-      lng: parseFloat(lng.toFixed(6))
+  if (routeData && routeData.routes && routeData.routes[0]) {
+    const coords = routeData.routes[0].geometry.coordinates.map(coord => ({
+      lat: parseFloat(coord[1].toFixed(6)),
+      lng: parseFloat(coord[0].toFixed(6))
     }));
+    return coords;
   }
 
-  console.warn('Both OSRM servers failed. Falling back to direct route.');
-  return [
-    { lat: parseFloat(startLat.toFixed(6)), lng: parseFloat(startLng.toFixed(6)) },
-    { lat: parseFloat(endLat.toFixed(6)), lng: parseFloat(endLng.toFixed(6)) }
-  ];
-}
-
-function generateSyntheticSignals(dispatchId, route, routeDistances) {
-  const totalDistance = routeDistances[routeDistances.length - 1] || 0;
-  const targetDistances = [];
-
-  for (let distance = 300; distance < totalDistance - 100; distance += 450) {
-    targetDistances.push(distance);
-  }
-
-  if (targetDistances.length === 0 && route.length > 2) {
-    targetDistances.push(totalDistance / 2);
-  }
-
-  return targetDistances.slice(0, 12).map((targetDistance, index) => {
-    let routeIndex = routeDistances.findIndex(distance => distance >= targetDistance);
-    if (routeIndex < 0) routeIndex = route.length - 1;
-
-    return {
-      id: `sig-${dispatchId}-${index}`,
-      lat: route[routeIndex].lat,
-      lng: route[routeIndex].lng,
-      routeIndex,
-      distanceAlongRoute: routeDistances[routeIndex],
-      source: 'synthetic',
-      status: 'normal'
-    };
-  });
+  console.warn('Both OSRM servers failed to calculate route.');
+  return null; // Return null to signal OSRM query failed
 }
 
 function toRoutePoint(point) {
@@ -154,6 +151,17 @@ function toRoutePoint(point) {
     lat: parseFloat(point.lat),
     lng: parseFloat(point.lng)
   };
+}
+
+function parseRouteGeometry(routeGeometry) {
+  if (Array.isArray(routeGeometry)) return routeGeometry;
+  if (!routeGeometry) return [];
+  try {
+    const parsed = typeof routeGeometry === 'string' ? JSON.parse(routeGeometry) : routeGeometry;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
 }
 
 function projectToMeters(point, originLat) {
@@ -239,57 +247,149 @@ function keepFirstSignalWithinDistance(signals) {
   return keptSignals;
 }
 
+async function queryEndpoints(endpoints, query, dispatchId) {
+  const promises = endpoints.map(async (endpoint) => {
+    try {
+      console.log(`[Overpass] Fetching traffic signals for dispatch ${dispatchId} from: ${endpoint}`);
+      const response = await axios.post(endpoint, new URLSearchParams({ data: query }).toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'IDP-Green-Corridor/1.0'
+        },
+        timeout: 10000 // 10 seconds timeout per mirror
+      });
+      if (response.data && Array.isArray(response.data.elements)) {
+        return { endpoint, elements: response.data.elements };
+      }
+      throw new Error('Invalid response structure');
+    } catch (err) {
+      throw new Error(`Endpoint ${endpoint} failed: ${err.message || err.code || 'Timeout'}`);
+    }
+  });
+
+  return new Promise((resolve) => {
+    let completedCount = 0;
+    let bestResult = null;
+    const errors = [];
+
+    promises.forEach((p) => {
+      p.then((result) => {
+        completedCount++;
+        if (result.elements.length > 0) {
+          resolve(result);
+        } else {
+          if (!bestResult) {
+            bestResult = result;
+          }
+          if (completedCount === promises.length) {
+            resolve(bestResult || { endpoint: 'none', elements: [] });
+          }
+        }
+      }).catch((err) => {
+        completedCount++;
+        errors.push(err);
+        console.warn(`[Overpass] ${err.message}`);
+        if (completedCount === promises.length) {
+          resolve(bestResult);
+        }
+      });
+    });
+  });
+}
+
 async function fetchSignalsOnRoute(dispatchId, route, routeDistances) {
   if (!Array.isArray(route) || route.length < 2) return [];
 
   const bbox = getRouteBoundingBox(route);
-  const query = `
-    [out:json][timeout:10];
-    node["highway"="traffic_signals"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});
-    out body;
-  `;
+  const query = `[out:json];node["highway"="traffic_signals"](${bbox.south},${bbox.west},${bbox.north},${bbox.east});out body;`;
 
-  const response = await axios.post(OVERPASS_API_URL, new URLSearchParams({ data: query }).toString(), {
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'IDP-Green-Corridor/1.0'
-    },
-    timeout: 12000
-  });
+  const processResponseElements = (elements, successEndpoint) => {
+    const seenNodeIds = new Set();
+    const candidates = elements
+      .filter(element => element.type === 'node' && Number.isFinite(element.lat) && Number.isFinite(element.lon))
+      .map((element) => {
+        const signalPoint = { lat: element.lat, lng: element.lon };
+        const match = getSignalRouteMatch(signalPoint, route, routeDistances);
+        return {
+          id: `osm-sig-${dispatchId}-${element.id}`,
+          osmId: element.id,
+          lat: parseFloat(element.lat.toFixed(6)),
+          lng: parseFloat(element.lon.toFixed(6)),
+          routeIndex: match.routeIndex,
+          distanceAlongRoute: match.distanceAlongRoute,
+          distanceToRoute: Math.round(match.distanceToRoute),
+          source: 'osm',
+          status: 'normal'
+        };
+      })
+      .filter((signal) => {
+        if (seenNodeIds.has(signal.osmId)) return false;
+        seenNodeIds.add(signal.osmId);
+        return signal.distanceToRoute <= SIGNAL_ROUTE_MATCH_DISTANCE_METERS;
+      })
+      .sort((a, b) => a.distanceAlongRoute - b.distanceAlongRoute);
+    const dedupedCandidates = keepFirstSignalWithinDistance(candidates).slice(0, 30);
 
-  const seenNodeIds = new Set();
-  const candidates = (response.data?.elements || [])
-    .filter(element => element.type === 'node' && Number.isFinite(element.lat) && Number.isFinite(element.lon))
-    .map((element) => {
-      const signalPoint = { lat: element.lat, lng: element.lon };
-      const match = getSignalRouteMatch(signalPoint, route, routeDistances);
-      return {
-        id: `osm-sig-${dispatchId}-${element.id}`,
-        osmId: element.id,
-        lat: parseFloat(element.lat.toFixed(6)),
-        lng: parseFloat(element.lon.toFixed(6)),
-        routeIndex: match.routeIndex,
-        distanceAlongRoute: match.distanceAlongRoute,
-        distanceToRoute: Math.round(match.distanceToRoute),
-        source: 'osm',
-        status: 'normal'
-      };
-    })
-    .filter((signal) => {
-      if (seenNodeIds.has(signal.osmId)) return false;
-      seenNodeIds.add(signal.osmId);
-      return signal.distanceToRoute <= SIGNAL_ROUTE_MATCH_DISTANCE_METERS;
-    })
-    .sort((a, b) => a.distanceAlongRoute - b.distanceAlongRoute);
-  const dedupedCandidates = keepFirstSignalWithinDistance(candidates).slice(0, 30);
+    console.log(
+      `OSM traffic signals for dispatch ${dispatchId} (from ${successEndpoint}): ` +
+      `${elements.length} fetched, ${candidates.length} matched within ${SIGNAL_ROUTE_MATCH_DISTANCE_METERS}m, ` +
+      `${dedupedCandidates.length} kept after ${SIGNAL_DEDUPE_DISTANCE_METERS}m dedupe`
+    );
 
-  console.log(
-    `OSM traffic signals for dispatch ${dispatchId}: ` +
-    `${response.data?.elements?.length || 0} fetched, ${candidates.length} matched within ${SIGNAL_ROUTE_MATCH_DISTANCE_METERS}m, ` +
-    `${dedupedCandidates.length} kept after ${SIGNAL_DEDUPE_DISTANCE_METERS}m dedupe`
-  );
+    return dedupedCandidates;
+  };
 
-  return dedupedCandidates;
+  // 0. Check database cache first!
+  try {
+    const [cachedSignals] = await db.query(
+      `SELECT osm_id, latitude, longitude FROM osm_traffic_signals
+       WHERE latitude >= ? AND latitude <= ? AND longitude >= ? AND longitude <= ?`,
+      [bbox.south, bbox.north, bbox.west, bbox.east]
+    );
+
+    if (cachedSignals.length > 0) {
+      console.log(`[OSM Cache] Found ${cachedSignals.length} traffic signals in database cache for dispatch ${dispatchId}.`);
+      const formattedCached = cachedSignals.map(row => ({
+        type: 'node',
+        id: row.osm_id,
+        lat: parseFloat(row.latitude),
+        lon: parseFloat(row.longitude)
+      }));
+      return processResponseElements(formattedCached, 'db_cache');
+    }
+  } catch (cacheErr) {
+    console.warn(`[OSM Cache] Failed to read from cache database: ${cacheErr.message}`);
+  }
+
+  // 1. Try primary endpoints first
+  const envUrl = process.env.OVERPASS_API_URL;
+  const primaryList = envUrl ? [envUrl, ...PRIMARY_ENDPOINTS] : PRIMARY_ENDPOINTS;
+  
+  let result = await queryEndpoints(primaryList, query, dispatchId);
+
+  // 2. If primary endpoints returned 0 elements or failed, try fallback list
+  if (!result || result.elements.length === 0) {
+    console.log(`[Overpass] Primary endpoints returned 0 elements or failed for dispatch ${dispatchId}. Trying fallback endpoints...`);
+    result = await queryEndpoints(FALLBACK_ENDPOINTS, query, dispatchId);
+  }
+
+  const elements = result ? result.elements : [];
+  const successEndpoint = result ? result.endpoint : 'none';
+
+  // 3. Cache the newly fetched elements to the database cache in the background
+  if (elements.length > 0) {
+    console.log(`[OSM Cache] Caching ${elements.length} newly fetched signals to database cache...`);
+    for (const elem of elements) {
+      if (elem.type === 'node' && Number.isFinite(elem.lat) && Number.isFinite(elem.lon)) {
+        db.query(
+          `INSERT IGNORE INTO osm_traffic_signals (osm_id, latitude, longitude) VALUES (?, ?, ?)`,
+          [elem.id, elem.lat, elem.lon]
+        ).catch(err => console.warn(`[OSM Cache] Failed to insert signal ${elem.id} to cache: ${err.message}`));
+      }
+    }
+  }
+
+  return processResponseElements(elements, successEndpoint);
 }
 
 async function generateSignals(dispatchId, route, routeDistances) {
@@ -300,15 +400,63 @@ async function generateSignals(dispatchId, route, routeDistances) {
     }
     console.warn(`No OSM traffic signals found on route for dispatch ${dispatchId}.`);
   } catch (err) {
-    console.warn(`Failed to fetch OSM traffic signals for dispatch ${dispatchId}.`, err.message);
-  }
-
-  if (USE_SYNTHETIC_SIGNAL_FALLBACK) {
-    console.warn(`Using synthetic traffic signals for dispatch ${dispatchId} because USE_SYNTHETIC_SIGNAL_FALLBACK=true.`);
-    return generateSyntheticSignals(dispatchId, route, routeDistances);
+    console.error(`Failed to fetch OSM traffic signals for dispatch ${dispatchId}.`, err.message);
   }
 
   return [];
+}
+
+async function deactivateActiveCorridors(dispatchId, dispatchMeta = {}) {
+  const [activeCorridors] = await db.query(
+    'SELECT id FROM green_corridors WHERE dispatch_id = ? AND status = "active"',
+    [dispatchId]
+  );
+
+  if (activeCorridors.length === 0) return;
+
+  await db.query(
+    'UPDATE green_corridors SET status = "inactive" WHERE dispatch_id = ? AND status = "active"',
+    [dispatchId]
+  );
+
+  if (!io) return;
+
+  const gcInactive = {
+    dispatchId,
+    incidentType: dispatchMeta.incidentType,
+    serviceType: dispatchMeta.serviceType,
+    vehicleId: dispatchMeta.vehicleId,
+    status: 'inactive',
+    signals: [],
+    route: []
+  };
+  io.emit('green_corridor_update', gcInactive);
+  io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', gcInactive);
+}
+
+async function stopTrackingSimulation(dispatchId) {
+  if (activeSimulations[dispatchId]) {
+    clearInterval(activeSimulations[dispatchId].intervalId);
+    delete activeSimulations[dispatchId];
+  }
+
+  const [dispatches] = await db.query(
+    `SELECT d.vehicle_id, s.type as s_type, i.type as i_type
+     FROM dispatches d
+     JOIN services s ON d.service_id = s.id
+     JOIN incidents i ON d.incident_id = i.id
+     WHERE d.id = ?`,
+    [dispatchId]
+  );
+
+  if (dispatches.length === 0) return;
+
+  const dispatch = dispatches[0];
+  await deactivateActiveCorridors(dispatchId, {
+    incidentType: dispatch.i_type,
+    serviceType: dispatch.s_type,
+    vehicleId: dispatch.vehicle_id
+  });
 }
 
 function updateSignalStates(signals, vehicleDistance) {
@@ -431,27 +579,33 @@ async function startTrackingSimulation(dispatchId) {
     const endLat = toFiniteCoordinate(dispatch.i_lat);
     const endLng = toFiniteCoordinate(dispatch.i_lng);
 
-    let route = [];
-    if (startLat !== null && startLng !== null && endLat !== null && endLng !== null) {
-      try {
-        route = await calculateRoute(startLat, startLng, endLat, endLng);
-        // Save the freshly calculated route to the database
-        await db.query(
-          'UPDATE dispatches SET route_geometry = ? WHERE id = ?',
-          [JSON.stringify(route), dispatchId]
-        );
-      } catch (err) {
-        console.warn('Failed to calculate fresh OSRM route for dispatch, using fallback:', err.message);
+    let route = parseRouteGeometry(dispatch.route_geometry);
+
+    // Only calculate fresh route if the existing one is empty or just a straight line fallback (<= 2 points)
+    if (!Array.isArray(route) || route.length <= 2) {
+      if (startLat !== null && startLng !== null && endLat !== null && endLng !== null) {
+        try {
+          const freshRoute = await calculateRoute(startLat, startLng, endLat, endLng);
+          if (freshRoute && freshRoute.length > 2) {
+            route = freshRoute;
+            // Save the freshly calculated route to the database
+            await db.query(
+              'UPDATE dispatches SET route_geometry = ? WHERE id = ?',
+              [JSON.stringify(route), dispatchId]
+            );
+          }
+        } catch (err) {
+          console.warn('Failed to calculate fresh OSRM route for dispatch:', err.message);
+        }
       }
     }
 
-    if (!route || route.length === 0) {
-      try {
-        route = JSON.parse(dispatch.route_geometry);
-      } catch (e) {
-        console.error('Failed to parse route geometry from DB:', e);
-        return;
-      }
+    // Ultimate fallback if still no route
+    if (!Array.isArray(route) || route.length === 0) {
+      route = [
+        { lat: startLat || 12.9716, lng: startLng || 77.5946 },
+        { lat: endLat || 12.9716, lng: endLng || 77.5946 }
+      ];
     }
 
     if (!route || route.length === 0) return;
@@ -498,14 +652,16 @@ async function startTrackingSimulation(dispatchId) {
       dispatchId
     };
 
-    io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
-    io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
-    io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
-    io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
-    io.emit('green_corridor_update', initialGCUpdate);
-    io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', initialGCUpdate);
-    io.emit('vehicle_tracking_update', initialTrackingUpdate);
-    io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', initialTrackingUpdate);
+    if (io) {
+      io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
+      io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'en_route' });
+      io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
+      io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'en_route' });
+      io.emit('green_corridor_update', initialGCUpdate);
+      io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', initialGCUpdate);
+      io.emit('vehicle_tracking_update', initialTrackingUpdate);
+      io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', initialTrackingUpdate);
+    }
 
     let vehicleDistance = 0;
     const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
@@ -546,10 +702,12 @@ async function startTrackingSimulation(dispatchId) {
         route
       };
 
-      io.emit('vehicle_tracking_update', trackingUpdateData);
-      io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingUpdateData);
-      io.emit('green_corridor_update', greenUpdateData);
-      io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', greenUpdateData);
+      if (io) {
+        io.emit('vehicle_tracking_update', trackingUpdateData);
+        io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingUpdateData);
+        io.emit('green_corridor_update', greenUpdateData);
+        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', greenUpdateData);
+      }
 
       // If reached destination
       if (vehicleDistance >= totalRouteDistance) {
@@ -576,12 +734,14 @@ async function startTrackingSimulation(dispatchId) {
         };
 
         // Broadcast destination reached
-        io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
-        io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
-        io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
-        io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
-        io.emit('green_corridor_update', gcInactive);
-        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', gcInactive);
+        if (io) {
+          io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
+          io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'at_scene' });
+          io.emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
+          io.to(`dispatch_${dispatchId}`).emit('incident_status_change', { incidentId: dispatch.incident_id, status: 'at_scene' });
+          io.emit('green_corridor_update', gcInactive);
+          io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', gcInactive);
+        }
       }
     }, VEHICLE_TRACKING_INTERVAL_MS);
 
@@ -592,7 +752,7 @@ async function startTrackingSimulation(dispatchId) {
   }
 }
 
-async function startReturnSimulation(dispatchId) {
+async function startReturnSimulation(dispatchId, needGreenCorridor = true) {
   if (activeSimulations[dispatchId]) {
     clearInterval(activeSimulations[dispatchId].intervalId);
     delete activeSimulations[dispatchId];
@@ -613,7 +773,13 @@ async function startReturnSimulation(dispatchId) {
 
     if (dispatches.length === 0) return;
     const dispatch = dispatches[0];
-    const isAmbulance = dispatch.vehicle_type === 'ambulance';
+    const canUseGreenCorridor = supportsGreenCorridor(dispatch.vehicle_type);
+
+    await deactivateActiveCorridors(dispatchId, {
+      incidentType: dispatch.i_type,
+      serviceType: dispatch.s_type,
+      vehicleId: dispatch.vehicle_id
+    });
 
     const stationLat = toFiniteCoordinate(dispatch.s_lat);
     const stationLng = toFiniteCoordinate(dispatch.s_lng);
@@ -625,7 +791,13 @@ async function startReturnSimulation(dispatchId) {
       return;
     }
 
-    const returnRoute = await calculateRoute(startLat, startLng, stationLat, stationLng);
+    let returnRoute = await calculateRoute(startLat, startLng, stationLat, stationLng);
+    if (!returnRoute) {
+      returnRoute = [
+        { lat: startLat, lng: startLng },
+        { lat: stationLat, lng: stationLng }
+      ];
+    }
     const routeDistances = getCumulativeRouteDistances(returnRoute);
     let returnSignals = [];
     let returnCorridorId = null;
@@ -640,18 +812,20 @@ async function startReturnSimulation(dispatchId) {
     // Log timeline event
     await db.addTimelineEvent(dispatch.incident_id, 'returning', `Vehicle ${dispatch.vehicle_id} is returning to station.`);
     
-    io.emit('vehicle_status_change', {
-      vehicleId: dispatch.vehicle_id,
-      status: 'returning',
-      route: returnRoute
-    });
-    io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', {
-      vehicleId: dispatch.vehicle_id,
-      status: 'returning',
-      route: returnRoute
-    });
+    if (io) {
+      io.emit('vehicle_status_change', {
+        vehicleId: dispatch.vehicle_id,
+        status: 'returning',
+        route: returnRoute
+      });
+      io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', {
+        vehicleId: dispatch.vehicle_id,
+        status: 'returning',
+        route: returnRoute
+      });
+    }
 
-    if (isAmbulance) {
+    if (canUseGreenCorridor && needGreenCorridor) {
       const [corridorResult] = await db.query(
         'INSERT INTO green_corridors (dispatch_id, status, signals_state) VALUES (?, "active", ?)',
         [dispatchId, JSON.stringify([])]
@@ -678,8 +852,25 @@ async function startReturnSimulation(dispatchId) {
         route: returnRoute
       };
 
-      io.emit('green_corridor_update', returnGCUpdate);
-      io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdate);
+      if (io) {
+        io.emit('green_corridor_update', returnGCUpdate);
+        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdate);
+      }
+    } else {
+      const returnGCInactive = {
+        dispatchId,
+        incidentType: dispatch.i_type,
+        serviceType: dispatch.s_type,
+        vehicleId: dispatch.vehicle_id,
+        status: 'inactive',
+        phase: 'returning',
+        signals: [],
+        route: []
+      };
+      if (io) {
+        io.emit('green_corridor_update', returnGCInactive);
+        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCInactive);
+      }
     }
 
     let vehicleDistance = 0;
@@ -704,10 +895,12 @@ async function startReturnSimulation(dispatchId) {
         dispatchId
       };
 
-      io.emit('vehicle_tracking_update', trackingReturnData);
-      io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingReturnData);
+      if (io) {
+        io.emit('vehicle_tracking_update', trackingReturnData);
+        io.to(`dispatch_${dispatchId}`).emit('vehicle_tracking_update', trackingReturnData);
+      }
 
-      if (isAmbulance && returnCorridorId) {
+      if (canUseGreenCorridor && returnCorridorId) {
         returnSignals = updateSignalStates(returnSignals, vehicleDistance);
         await db.query(
           'UPDATE green_corridors SET signals_state = ? WHERE id = ?',
@@ -725,8 +918,10 @@ async function startReturnSimulation(dispatchId) {
           route: returnRoute
         };
 
-        io.emit('green_corridor_update', returnGCUpdateLoop);
-        io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdateLoop);
+        if (io) {
+          io.emit('green_corridor_update', returnGCUpdateLoop);
+          io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCUpdateLoop);
+        }
       }
 
       if (vehicleDistance >= totalRouteDistance) {
@@ -743,10 +938,12 @@ async function startReturnSimulation(dispatchId) {
         // Log timeline event
         await db.addTimelineEvent(dispatch.incident_id, 'completed', `Vehicle ${dispatch.vehicle_id} return completed and is back at station.`);
 
-        io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
-        io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+        if (io) {
+          io.emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+          io.to(`dispatch_${dispatchId}`).emit('vehicle_status_change', { vehicleId: dispatch.vehicle_id, status: 'available', latitude: dispatch.s_lat, longitude: dispatch.s_lng });
+        }
         
-        if (isAmbulance) {
+        if (canUseGreenCorridor && returnCorridorId) {
           const returnGCInactive = {
             dispatchId,
             incidentType: dispatch.i_type,
@@ -757,8 +954,10 @@ async function startReturnSimulation(dispatchId) {
             signals: [],
             route: []
           };
-          io.emit('green_corridor_update', returnGCInactive);
-          io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCInactive);
+          if (io) {
+            io.emit('green_corridor_update', returnGCInactive);
+            io.to(`dispatch_${dispatchId}`).emit('green_corridor_update', returnGCInactive);
+          }
         }
       }
     }, VEHICLE_TRACKING_INTERVAL_MS);
@@ -779,5 +978,6 @@ module.exports = {
   broadcastServiceAlerted,
   broadcastVehicleDispatched,
   startTrackingSimulation,
-  startReturnSimulation
+  startReturnSimulation,
+  stopTrackingSimulation
 };

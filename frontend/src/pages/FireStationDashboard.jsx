@@ -2,9 +2,12 @@ import React, { useRef, useState, useEffect } from 'react';
 import { serviceAPI, incidentsAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
+import DashboardShell from '../components/DashboardShell';
+import PasswordInput from '../components/PasswordInput';
+import FleetManager from '../components/FleetManager';
 import { 
   ShieldAlert, Flame, Send, CheckCircle2, Play, MapPin, Clock, 
-  Navigation, Power, Settings, BarChart2, List, Search, Calendar, 
+  Navigation, Settings, BarChart2, List, Search, Calendar, 
   User, Check, AlertCircle, HelpCircle, Activity, Shield, Droplet
 } from 'lucide-react';
 
@@ -58,6 +61,7 @@ export default function FireStationDashboard({ user, onLogout }) {
   const [resolveTimeToControl, setResolveTimeToControl] = useState('');
   const [resolveTimeToExtinguish, setResolveTimeToExtinguish] = useState('');
   const [showResolveModal, setShowResolveModal] = useState(false);
+  const [needGreenCorridor, setNeedGreenCorridor] = useState(true);
 
   const activeDispatchesRef = useRef([]);
 
@@ -111,6 +115,12 @@ export default function FireStationDashboard({ user, onLogout }) {
         latitude: data.latitude || v.latitude, 
         longitude: data.longitude || v.longitude 
       } : v));
+
+      if (Array.isArray(data.route) && data.route.length > 0) {
+        setActiveDispatches(prev => prev.map(d =>
+          d.vehicle_id === data.vehicleId ? { ...d, route_geometry: data.route } : d
+        ));
+      }
 
       // Reload dispatches when a vehicle status changes
       loadActiveDispatches();
@@ -172,15 +182,24 @@ export default function FireStationDashboard({ user, onLogout }) {
       const dispatches = activeRes.data;
       setActiveDispatches(dispatches);
 
-      // Setup initial corridors and tracking pos
-      const newCorridors = {};
+      setCorridorsState(prev => {
+        const newCorridors = {};
+        dispatches.forEach(d => {
+          const previousCorridor = prev[d.id];
+          const apiSignals = d.signals || [];
+          newCorridors[d.id] = {
+            corridorActive: Boolean(d.corridor_active),
+            signals: apiSignals.length > 0
+              ? apiSignals
+              : (Boolean(d.corridor_active) && previousCorridor?.signals?.length > 0 ? previousCorridor.signals : apiSignals)
+          };
+        });
+        return newCorridors;
+      });
+
       const newTracking = {};
       
       dispatches.forEach(d => {
-        newCorridors[d.id] = {
-          corridorActive: Boolean(d.corridor_active),
-          signals: d.signals || []
-        };
         if (d.v_lat && d.v_lng) {
           newTracking[d.id] = {
             latitude: parseFloat(d.v_lat),
@@ -190,7 +209,6 @@ export default function FireStationDashboard({ user, onLogout }) {
         }
       });
 
-      setCorridorsState(newCorridors);
       setTrackingPositions(newTracking);
 
       // Auto select current active dispatch if not set
@@ -257,18 +275,27 @@ export default function FireStationDashboard({ user, onLogout }) {
     if (!user.serviceId) return;
     setProfileLoading(true);
     try {
-      const res = await serviceAPI.getProfile(user.serviceId);
-      setProfileName(res.data.name);
-      setProfilePhone(res.data.phone);
-      setProfileAddress(res.data.address);
-      setProfileLat(res.data.latitude);
-      setProfileLng(res.data.longitude);
-      setProfileEmail(res.data.email);
+      const [profileRes, vehiclesRes] = await Promise.all([
+        serviceAPI.getProfile(user.serviceId),
+        serviceAPI.getVehicles(user.serviceId)
+      ]);
+      setProfileName(profileRes.data.name);
+      setProfilePhone(profileRes.data.phone);
+      setProfileAddress(profileRes.data.address);
+      setProfileLat(profileRes.data.latitude);
+      setProfileLng(profileRes.data.longitude);
+      setProfileEmail(profileRes.data.email);
+      setVehicles(vehiclesRes.data);
     } catch (err) {
       console.error(err);
     } finally {
       setProfileLoading(false);
     }
+  };
+
+  const handleFleetChange = (updatedVehicles) => {
+    setVehicles(updatedVehicles);
+    loadStats();
   };
 
   const handleDispatch = async (alertId) => {
@@ -320,6 +347,7 @@ export default function FireStationDashboard({ user, onLogout }) {
     setResolveWater('');
     setResolveTimeToControl('');
     setResolveTimeToExtinguish('');
+    setNeedGreenCorridor(true);
     setShowResolveModal(true);
   };
 
@@ -333,7 +361,8 @@ export default function FireStationDashboard({ user, onLogout }) {
         fireSeverity: resolveSeverity,
         waterConsumption: resolveWater ? parseInt(resolveWater) : null,
         timeToControl: resolveTimeToControl ? parseInt(resolveTimeToControl) : null,
-        timeToExtinguish: resolveTimeToExtinguish ? parseInt(resolveTimeToExtinguish) : null
+        timeToExtinguish: resolveTimeToExtinguish ? parseInt(resolveTimeToExtinguish) : null,
+        needGreenCorridor
       });
       setFeedback('Emergency resolved! Fire Engine is returning to station.');
       setShowResolveModal(false);
@@ -427,103 +456,61 @@ export default function FireStationDashboard({ user, onLogout }) {
       ]
     : serviceCenter;
 
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-[#0b0f19] via-[#070b13] to-[#0d1323] flex flex-col font-inter">
-      {/* Top Navbar */}
-      <nav className="glass-panel border-b border-white/5 py-4 px-6 flex flex-col md:flex-row justify-between items-center gap-4 shadow-xl relative z-20">
-        <div className="flex items-center gap-3">
-          <div className="p-2.5 bg-red-600/10 text-red-400 rounded-xl border border-red-500/20 shadow-inner">
-            <Flame size={20} className="animate-pulse" />
-          </div>
+  const fireTabs = [
+    { id: 'dashboard', label: 'Console', icon: Activity, onClick: () => setActiveTab('dashboard') },
+    { id: 'history', label: 'Service History', icon: List, onClick: () => { setActiveTab('history'); loadHistory(); } },
+    { id: 'profile', label: 'Profile', icon: Settings, onClick: () => { setActiveTab('profile'); loadProfile(); } }
+  ];
+
+  const statsBanner = activeTab !== 'profile' ? (
+    <div className="max-w-[1600px] mx-auto w-full px-4 sm:px-6 pb-2 shrink-0">
+      <div className="stat-grid">
+        <div className="stat-card">
           <div>
-            <h1 className="text-lg font-black tracking-tight text-white leading-tight">{user.name}</h1>
-            <p className="text-[11px] text-gray-400">Fire Station Operator Dispatch Console</p>
+            <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Total Dispatches</span>
+            <strong className="text-xl text-white font-mono">{stats.totalIncidents}</strong>
           </div>
+          <BarChart2 size={22} className="text-red-500/40 shrink-0" />
         </div>
-
-        {/* Navigation Tabs */}
-        <div className="flex items-center justify-between w-full md:w-auto gap-4">
-          <div className="flex bg-white/5 p-1 rounded-xl border border-white/10 shadow-inner">
-            <button
-              onClick={() => setActiveTab('dashboard')}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'dashboard' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Activity size={13} />
-              Console
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('history');
-                loadHistory();
-              }}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'history' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <List size={13} />
-              Service History
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('profile');
-                loadProfile();
-              }}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'profile' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Settings size={13} />
-              Profile
-            </button>
+        <div className="stat-card">
+          <div>
+            <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Active Dispatches</span>
+            <strong className="text-xl text-amber-500 font-mono">{stats.activeVehicles}</strong>
           </div>
-
-          <button onClick={onLogout} className="p-2.5 rounded-xl bg-white/5 border border-white/10 text-gray-400 hover:text-red-400 hover:border-red-500/20 hover:bg-red-500/5 transition-all" title="Sign Out">
-            <Power size={18} />
-          </button>
+          <Activity size={22} className="text-amber-500/40 shrink-0" />
         </div>
-      </nav>
-
-      {/* Stats Banner Row */}
-      {activeTab !== 'profile' && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 px-6 pt-6 shrink-0">
-          <div className="glass-panel p-4 rounded-xl border border-white/5 bg-[#0b0e17] flex justify-between items-center shadow-inner">
-            <div>
-              <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Total Dispatches</span>
-              <strong className="text-xl text-white font-mono">{stats.totalIncidents}</strong>
-            </div>
-            <BarChart2 size={24} className="text-red-500/40" />
+        <div className="stat-card">
+          <div>
+            <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Available Fleet</span>
+            <strong className="text-xl text-emerald-400 font-mono">{stats.availableVehicles}</strong>
           </div>
-
-          <div className="glass-panel p-4 rounded-xl border border-white/5 bg-[#0b0e17] flex justify-between items-center shadow-inner">
-            <div>
-              <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Active Dispatches</span>
-              <strong className="text-xl text-amber-500 font-mono">{stats.activeVehicles}</strong>
-            </div>
-            <Activity size={24} className="text-amber-500/40" />
-          </div>
-
-          <div className="glass-panel p-4 rounded-xl border border-white/5 bg-[#0b0e17] flex justify-between items-center shadow-inner">
-            <div>
-              <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Available Fleet</span>
-              <strong className="text-xl text-emerald-400 font-mono">{stats.availableVehicles}</strong>
-            </div>
-            <Flame size={24} className="text-emerald-500/40" />
-          </div>
-
-          <div className="glass-panel p-4 rounded-xl border border-white/5 bg-[#0b0e17] flex justify-between items-center shadow-inner">
-            <div>
-              <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Avg. Response Time</span>
-              <strong className="text-sm text-white font-bold">{stats.avgResponseTime}</strong>
-            </div>
-            <Clock size={24} className="text-indigo-500/40" />
-          </div>
+          <Flame size={22} className="text-emerald-500/40 shrink-0" />
         </div>
-      )}
+        <div className="stat-card">
+          <div>
+            <span className="text-[9px] text-gray-500 block uppercase font-bold tracking-wider">Avg. Response Time</span>
+            <strong className="text-sm text-white font-bold">{stats.avgResponseTime}</strong>
+          </div>
+          <Clock size={22} className="text-indigo-500/40 shrink-0" />
+        </div>
+      </div>
+    </div>
+  ) : null;
 
-      {/* Main Panel */}
-      <main className="flex-1 w-full max-w-none px-6 py-6 flex flex-col lg:h-[calc(100vh-140px)] lg:overflow-hidden">
-        
+  return (
+    <DashboardShell
+      icon={Flame}
+      iconClassName="bg-red-600/10 text-red-400 border-red-500/20"
+      title={user.name}
+      subtitle="Fire Station Operator Dispatch Console"
+      tabs={fireTabs}
+      activeTab={activeTab}
+      onLogout={onLogout}
+      banner={statsBanner}
+    >
         {activeTab === 'dashboard' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch flex-1 h-full lg:overflow-hidden">
-            
-            {/* Left column: Alerts & Dispatch panels (5 cols) */}
-            <div className="lg:col-span-5 flex flex-col space-y-6 h-auto lg:h-full overflow-hidden">
+          <div className="content-grid">
+            <div className="lg:col-span-5 flex flex-col gap-4 sm:gap-6 min-h-0 overflow-hidden">
               
               {feedback && (
                 <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-semibold shadow-inner shrink-0">
@@ -689,7 +676,7 @@ export default function FireStationDashboard({ user, onLogout }) {
             </div>
 
             {/* Right column: Map (7 cols) */}
-            <div className="lg:col-span-7 glass-panel p-4 rounded-2xl flex flex-col h-[400px] lg:h-full overflow-hidden">
+            <div className="lg:col-span-7 map-panel-wrap">
               <div className="mb-2 flex justify-between items-center px-2 pb-1.5">
                 <span className="text-xs font-bold text-gray-300">Dispatch Map Visualizer</span>
                 {activeDispatch && (
@@ -724,9 +711,8 @@ export default function FireStationDashboard({ user, onLogout }) {
         )}
 
         {activeTab === 'history' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch flex-1 h-full lg:overflow-hidden">
-            {/* Left side: History List & Search (5 cols) */}
-            <div className="lg:col-span-5 glass-panel p-5 rounded-2xl flex flex-col h-[400px] lg:h-full overflow-hidden">
+          <div className="content-grid">
+            <div className="lg:col-span-5 sidebar-panel">
               <div className="space-y-4 pb-4 border-b border-white/5 shrink-0">
                 <h3 className="text-sm font-bold text-white uppercase tracking-wider">Service History logs</h3>
                 <div className="flex gap-2">
@@ -828,7 +814,7 @@ export default function FireStationDashboard({ user, onLogout }) {
             </div>
 
             {/* Right side: Selected Incident Details and Timeline (7 cols) */}
-            <div className="lg:col-span-7 glass-panel p-5 rounded-2xl flex flex-col h-[400px] lg:h-full overflow-hidden">
+            <div className="lg:col-span-7 map-panel-wrap">
               {selectedHistoryItem ? (
                 <div className="flex-1 flex flex-col justify-between overflow-hidden">
                   <div className="pb-4 border-b border-white/5 shrink-0 flex justify-between items-start">
@@ -1000,16 +986,17 @@ export default function FireStationDashboard({ user, onLogout }) {
                           className="w-full px-4 py-2.5 rounded-xl glass-input text-white text-xs focus:border-blue-500 shadow-inner"
                         />
                       </div>
-                      <div>
-                        <label className="block text-[10px] uppercase font-bold tracking-wider text-gray-400 mb-1.5">New Password (Leave blank to keep current)</label>
-                        <input
-                          type="password"
-                          value={profilePassword}
-                          onChange={(e) => setProfilePassword(e.target.value)}
-                          placeholder="••••••••"
-                          className="w-full px-4 py-2.5 rounded-xl glass-input text-white text-xs focus:border-blue-500 shadow-inner"
-                        />
-                      </div>
+                      <PasswordInput
+                        id="fire-profile-password"
+                        label="New Password (Leave blank to keep current)"
+                        value={profilePassword}
+                        onChange={(e) => setProfilePassword(e.target.value)}
+                        placeholder="Enter new password"
+                        showIcon={false}
+                        labelClassName="block text-[10px] uppercase font-bold tracking-wider text-gray-400 mb-1.5"
+                        inputClassName="text-xs py-2.5 focus:border-red-500"
+                        autoComplete="new-password"
+                      />
                     </div>
 
                     <div>
@@ -1050,11 +1037,22 @@ export default function FireStationDashboard({ user, onLogout }) {
                     <button
                       type="submit"
                       disabled={profileSaving}
-                      className="w-full py-3 px-4 rounded-xl text-white font-bold bg-blue-600 hover:bg-blue-500 transition shadow-lg mt-4"
+                      className="w-full py-3 px-4 rounded-xl text-white font-bold bg-red-600 hover:bg-red-500 transition shadow-lg mt-4"
                     >
                       {profileSaving ? 'Saving changes...' : 'Save Configuration'}
                     </button>
                   </form>
+                )}
+
+                {!profileLoading && (
+                  <FleetManager
+                    serviceId={user.serviceId}
+                    vehicles={vehicles}
+                    vehicleLabel="Fire Engine"
+                    idPrefix="FIRE-"
+                    accent="red"
+                    onFleetChange={handleFleetChange}
+                  />
                 )}
               </div>
             </div>
@@ -1088,12 +1086,9 @@ export default function FireStationDashboard({ user, onLogout }) {
           </div>
         )}
 
-      </main>
-
-      {/* Resolve Outcome Modal */}
       {showResolveModal && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="glass-panel w-full max-w-md p-6 rounded-2xl border border-white/10 glow-blue animate-scale-in">
+        <div className="modal-overlay">
+          <div className="modal-card glow-red">
             <h3 className="text-base font-bold text-white uppercase tracking-tight mb-2">Resolve Fire Emergency</h3>
             <p className="text-xs text-gray-400 mb-4">Please log the fire severity, water consumption, and extinguishment timings before closing this dispatch.</p>
             
@@ -1164,6 +1159,19 @@ export default function FireStationDashboard({ user, onLogout }) {
                 />
               </div>
 
+              <div className="flex items-center gap-2.5 p-3 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
+                <input
+                  type="checkbox"
+                  id="needGreenCorridor"
+                  checked={needGreenCorridor}
+                  onChange={(e) => setNeedGreenCorridor(e.target.checked)}
+                  className="w-4 h-4 rounded accent-emerald-500 cursor-pointer"
+                />
+                <label htmlFor="needGreenCorridor" className="text-xs font-semibold text-gray-300 cursor-pointer select-none">
+                  Request Green Corridor for return journey?
+                </label>
+              </div>
+
               <div className="flex gap-3 justify-end pt-2">
                 <button
                   type="button"
@@ -1184,6 +1192,6 @@ export default function FireStationDashboard({ user, onLogout }) {
         </div>
       )}
 
-    </div>
+    </DashboardShell>
   );
 }

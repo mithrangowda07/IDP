@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { adminAPI, incidentsAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
+import DashboardShell from '../components/DashboardShell';
 import { Shield, List, Building, Check, X, ShieldAlert, RefreshCw, Car, Navigation, Settings, Phone } from 'lucide-react';
 
 export default function AdminDashboard({ user, onLogout }) {
@@ -36,6 +37,7 @@ export default function AdminDashboard({ user, onLogout }) {
   const [routePoints, setRoutePoints] = useState([]);
   const [corridorActive, setCorridorActive] = useState(false);
   const [signals, setSignals] = useState([]);
+  const [activeDispatch, setActiveDispatch] = useState(null);
   const selectedIncidentRef = useRef(null);
 
   useEffect(() => {
@@ -83,13 +85,19 @@ export default function AdminDashboard({ user, onLogout }) {
     // Tracking simulations listener
     socket.on('vehicle_tracking_update', (data) => {
       console.log('Admin socket: vehicle tracking:', data);
-      setTrackingVehicle({
-        id: data.vehicleId,
-        latitude: parseFloat(data.latitude),
-        longitude: parseFloat(data.longitude),
-        type: data.vehicleId.startsWith('AMB') ? 'ambulance' : 'fire_engine',
-        status: data.status,
-        progress: data.progress
+      setActiveDispatch(currDispatch => {
+        if (!currDispatch || String(currDispatch.id) !== String(data.dispatchId)) {
+          return currDispatch;
+        }
+        setTrackingVehicle({
+          id: data.vehicleId,
+          latitude: parseFloat(data.latitude),
+          longitude: parseFloat(data.longitude),
+          type: data.vehicleId.startsWith('AMB') ? 'ambulance' : 'fire_engine',
+          status: data.status,
+          progress: data.progress
+        });
+        return currDispatch;
       });
     });
 
@@ -112,16 +120,22 @@ export default function AdminDashboard({ user, onLogout }) {
       if (user.role === 'medical_admin' && !['accident', 'medical_emergency', 'other'].includes(data.incidentType)) return;
       if (user.role === 'fire_admin' && !['fire', 'gas_leak', 'building_collapse'].includes(data.incidentType)) return;
 
-      if (data.status === 'active') {
-        setCorridorActive(true);
-        setSignals(data.signals);
-        setRoutePoints(data.route);
-      } else {
-        setCorridorActive(false);
-        setSignals([]);
-        setRoutePoints([]);
-        setTrackingVehicle(null);
-      }
+      setActiveDispatch(currDispatch => {
+        if (!currDispatch || String(currDispatch.id) !== String(data.dispatchId)) {
+          return currDispatch;
+        }
+        if (data.status === 'active') {
+          setCorridorActive(true);
+          setSignals(data.signals);
+          setRoutePoints(data.route);
+        } else {
+          setCorridorActive(false);
+          setSignals([]);
+          setRoutePoints([]);
+          setTrackingVehicle(null);
+        }
+        return currDispatch;
+      });
     });
 
     return () => {
@@ -210,6 +224,7 @@ export default function AdminDashboard({ user, onLogout }) {
         if (pathResponse.data.dispatch) {
           // If already dispatched/alerted, display existing route
           const dispatch = pathResponse.data.dispatch;
+          setActiveDispatch(dispatch);
           setRouteInfo({
             distance: dispatch.distance || 0,
             normalEta: dispatch.normal_eta,
@@ -220,6 +235,7 @@ export default function AdminDashboard({ user, onLogout }) {
           setCorridorActive(Boolean(dispatch.corridor_active));
           setSignals(dispatch.signals || []);
         } else {
+          setActiveDispatch(null);
           // Calculate temporary route for visualization
           const routingCheck = await incidentsAPI.checkRoute({
             startLat: recommended.latitude,
@@ -343,69 +359,58 @@ export default function AdminDashboard({ user, onLogout }) {
     }
   };
 
+  const iconClassName = user.role === 'fire_admin'
+    ? 'bg-red-600/10 text-red-400 border-red-500/20'
+    : 'bg-blue-600/10 text-blue-400 border-blue-500/20';
+
+  const dashboardTitle = `${user.role.replace('_', ' ').split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')} Console`;
+
+  const tabs = [
+    {
+      id: 'incidents',
+      label: 'Emergency Feeds',
+      onClick: () => setActiveTab('incidents'),
+    },
+    {
+      id: 'approvals',
+      label: 'Service Verifications',
+      badge: pendingServices.length,
+      onClick: () => {
+        setActiveTab('approvals');
+        loadPendingRegistrations();
+      },
+    },
+    {
+      id: 'contacts',
+      label: 'Emergency Contacts',
+      icon: Settings,
+      onClick: () => {
+        setActiveTab('contacts');
+        loadEmergencyContacts();
+      },
+    },
+  ];
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-[#0b0f19] via-[#070b13] to-[#0d1323] flex flex-col font-inter">
-      {/* Navbar */}
-      <nav className="glass-panel border-b border-white/5 py-4 px-6 flex flex-col md:flex-row justify-between items-center gap-4 shadow-xl relative z-20">
-        <div className="flex items-center gap-3">
-          <div className={`p-2.5 rounded-xl border shadow-inner ${user.role === 'fire_admin' ? 'bg-red-600/10 text-red-400 border-red-500/20' : 'bg-blue-600/10 text-blue-400 border-blue-500/20'}`}>
-            <Shield size={20} className="animate-pulse" />
-          </div>
-          <div>
-            <h1 className="text-lg font-black tracking-tight text-white capitalize leading-tight">{user.role.replace('_', ' ')} Console</h1>
-            <p className="text-[11px] text-gray-400">Integrated Emergency Response and Corridor System</p>
-          </div>
+    <DashboardShell
+      icon={Shield}
+      iconClassName={iconClassName}
+      title={dashboardTitle}
+      subtitle="Integrated Emergency Response and Corridor System"
+      tabs={tabs}
+      activeTab={activeTab}
+      onLogout={onLogout}
+    >
+      {feedbackMsg && (
+        <div className="mb-4 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-semibold shadow-inner">
+          {feedbackMsg}
         </div>
+      )}
 
-        <div className="flex flex-col sm:flex-row items-center gap-4 w-full md:w-auto justify-between">
-          <div className="flex flex-wrap bg-white/5 p-1 rounded-xl border border-white/10 shadow-inner">
-            <button
-              onClick={() => setActiveTab('incidents')}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 ${activeTab === 'incidents' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              Emergency Feeds
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('approvals');
-                loadPendingRegistrations();
-              }}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 ${activeTab === 'approvals' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              Service Verifications ({pendingServices.length})
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('contacts');
-                loadEmergencyContacts();
-              }}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'contacts' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Settings size={13} />
-              Emergency Contacts
-            </button>
-          </div>
-
-          <button onClick={onLogout} className="px-4 py-2 bg-red-600/10 border border-red-500/20 hover:bg-red-600 hover:text-white text-xs font-bold rounded-xl text-red-400 transition active:scale-95 shadow-md">
-            Sign Out
-          </button>
-        </div>
-      </nav>
-
-      {/* Main body */}
-      <main className="flex-1 w-full max-w-none px-6 py-6 flex flex-col lg:h-[calc(100vh-80px)] lg:overflow-hidden">
-        
-        {feedbackMsg && (
-          <div className="mb-4 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-semibold shadow-inner">
-            {feedbackMsg}
-          </div>
-        )}
-
-        {activeTab === 'incidents' ? (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch flex-1 h-full lg:overflow-hidden">
-            
-            {/* Widget 1: Live Incident Feed (3 cols) */}
-            <div className="lg:col-span-3 glass-panel p-5 rounded-2xl flex flex-col h-[400px] lg:h-full overflow-hidden">
+      {activeTab === 'incidents' ? (
+        <div className="content-grid">
+          {/* Widget 1: Live Incident Feed (3 cols) */}
+          <div className="lg:col-span-3 sidebar-panel">
               <div className="flex justify-between items-center mb-4 pb-2 border-b border-white/5">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-gray-300 flex items-center gap-1.5">
                   <List size={16} className="text-blue-400" /> Live Incident Feed
@@ -439,9 +444,9 @@ export default function AdminDashboard({ user, onLogout }) {
               </div>
             </div>
 
-            {/* Widget 3: Live Map Panel (6 cols) */}
-            <div className="lg:col-span-6 flex flex-col h-[400px] lg:h-full space-y-4 overflow-hidden">
-              <div className="flex-1 rounded-2xl overflow-hidden relative border border-white/5 shadow-inner">
+          {/* Widget 3: Live Map Panel (6 cols) */}
+          <div className="lg:col-span-6 map-panel-wrap space-y-4">
+            <div className="flex-1 min-h-0 rounded-xl overflow-hidden relative">
                 <MapPanel
                   incidents={incidents}
                   activeIncident={selectedIncident}
@@ -455,8 +460,8 @@ export default function AdminDashboard({ user, onLogout }) {
               </div>
 
               {/* Route calculations display overlay if route is available */}
-              {routeInfo && (
-                <div className="glass-panel p-4 rounded-2xl grid grid-cols-2 sm:grid-cols-4 gap-4 border border-emerald-500/20 shadow-lg shrink-0">
+            {routeInfo && (
+              <div className="panel p-4 grid grid-cols-2 sm:grid-cols-4 gap-4 border-emerald-500/20 shadow-lg shrink-0">
                   <div className="text-center">
                     <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Route Distance</span>
                     <strong className="text-base text-white font-black">{routeInfo.distance} km</strong>
@@ -479,11 +484,10 @@ export default function AdminDashboard({ user, onLogout }) {
               )}
             </div>
 
-            {/* Right panels: Incident Details (Widget 2) & Nearby Services (Widget 4) (3 cols) */}
-            <div className="lg:col-span-3 flex flex-col h-auto lg:h-full space-y-4 overflow-hidden">
-              
-              {/* Widget 2: Incident Details */}
-              <div className="glass-panel p-4 rounded-2xl flex-1 flex flex-col overflow-y-auto min-h-[220px]">
+          {/* Right panels: Incident Details (Widget 2) & Nearby Services (Widget 4) (3 cols) */}
+          <div className="lg:col-span-3 flex flex-col gap-4 min-h-0 lg:h-full overflow-hidden">
+            {/* Widget 2: Incident Details */}
+            <div className="sidebar-panel flex-1 overflow-y-auto min-h-[220px]">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-gray-300 mb-3 flex items-center gap-1.5 pb-2 border-b border-white/5">
                   <ShieldAlert size={16} className="text-blue-400" /> Incident Details
                 </h3>
@@ -621,8 +625,8 @@ export default function AdminDashboard({ user, onLogout }) {
                 )}
               </div>
 
-              {/* Widget 4: Nearby Services Panel */}
-              <div className="glass-panel p-4 rounded-2xl h-[280px] flex flex-col overflow-hidden shrink-0">
+            {/* Widget 4: Nearby Services Panel */}
+            <div className="sidebar-panel shrink-0">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-gray-300 mb-3 flex items-center gap-1.5 pb-2 border-b border-white/5">
                   <Building size={16} className="text-blue-400" /> Nearby Services Discovery
                 </h3>
@@ -674,7 +678,7 @@ export default function AdminDashboard({ user, onLogout }) {
           </div>
         ) : activeTab === 'approvals' ? (
           /* Verification approvals tab */
-          <div className="glass-panel p-6 rounded-2xl flex-1 flex flex-col overflow-hidden max-h-[85vh] lg:max-h-full">
+          <div className="panel p-6 flex-1 flex flex-col overflow-hidden min-h-0">
             <h3 className="text-lg font-bold text-white tracking-tight">Pending Service Registrations</h3>
             <p className="text-xs text-gray-400 mb-6 mt-1">Review hospital and fire station registrations and enable their logins.</p>
 
@@ -732,7 +736,7 @@ export default function AdminDashboard({ user, onLogout }) {
             )}
           </div>
         ) : (
-          <div className="glass-panel p-6 rounded-2xl flex-1 flex flex-col overflow-hidden max-h-[85vh] lg:max-h-full">
+          <div className="panel p-6 flex-1 flex flex-col overflow-hidden min-h-0">
             <div className="mb-6 pb-4 border-b border-white/5">
               <h3 className="text-lg font-bold text-white tracking-tight">Emergency Coordinator Contacts</h3>
               <p className="text-xs text-gray-400 mt-1">These numbers are used by the citizen emergency assistance call button.</p>
@@ -784,7 +788,6 @@ export default function AdminDashboard({ user, onLogout }) {
             )}
           </div>
         )}
-      </main>
-    </div>
+    </DashboardShell>
   );
 }

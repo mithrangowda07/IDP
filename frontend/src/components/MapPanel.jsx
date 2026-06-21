@@ -357,7 +357,7 @@ export default function MapPanel({
                 <p className="text-[10px] text-slate-400 mt-1">
                   {signal.status === 'green'
                     ? `${signal.distanceAhead ?? 0} m ahead - priority override active`
-                    : 'Waiting for vehicle to enter the 200 m clearance range'}
+                    : 'Waiting for vehicle to enter the 500 m clearance range'}
                 </p>
                 {signal.source === 'osm' && (
                   <p className="text-[10px] text-slate-400 mt-1">

@@ -89,7 +89,7 @@ export default function App() {
   };
 
   return (
-    <div className="text-white bg-[#070b13] min-h-screen">
+    <div className="text-white bg-[#070b13] min-h-[100dvh] overflow-x-hidden">
       {renderContent()}
     </div>
   );

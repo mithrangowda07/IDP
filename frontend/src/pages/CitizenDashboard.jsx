@@ -2,9 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { citizenAPI, incidentsAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
+import DashboardShell from '../components/DashboardShell';
+import PasswordInput from '../components/PasswordInput';
 import { 
   MapPin, Navigation, Upload, CheckCircle2, AlertTriangle, Clock, 
-  Power, BarChart2, 
+  BarChart2, 
   HeartHandshake, Compass, Settings, Activity, Shield, Check, PhoneCall
 } from 'lucide-react';
 
@@ -101,25 +103,37 @@ export default function CitizenDashboard({ user, onLogout }) {
 
     socket.on('vehicle_tracking_update', (data) => {
       console.log('Real-time vehicle tracking update:', data);
-      setTrackVehicle(prev => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          latitude: data.latitude,
-          longitude: data.longitude,
-          status: data.status,
-          progress: data.progress
-        };
+      setTrackDispatch(currDispatch => {
+        if (!currDispatch || String(currDispatch.id) !== String(data.dispatchId)) {
+          return currDispatch;
+        }
+        setTrackVehicle(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            latitude: data.latitude,
+            longitude: data.longitude,
+            status: data.status,
+            progress: data.progress
+          };
+        });
+        return currDispatch;
       });
     });
 
     socket.on('green_corridor_update', (data) => {
       console.log('Real-time corridor update:', data);
-      setTrackSignals(data.signals || []);
-      setTrackCorridorActive(data.status === 'active');
-      if (data.route) {
-        setTrackRoutePoints(data.route);
-      }
+      setTrackDispatch(currDispatch => {
+        if (!currDispatch || String(currDispatch.id) !== String(data.dispatchId)) {
+          return currDispatch;
+        }
+        setTrackSignals(data.signals || []);
+        setTrackCorridorActive(data.status === 'active');
+        if (data.route) {
+          setTrackRoutePoints(data.route);
+        }
+        return currDispatch;
+      });
     });
 
     socket.on('timeline_update', (data) => {
@@ -434,85 +448,24 @@ export default function CitizenDashboard({ user, onLogout }) {
     }
   };
 
+  const citizenTabs = [
+    { id: 'report', label: 'Report', icon: AlertTriangle, onClick: () => setActiveTab('report') },
+    { id: 'my-incidents', label: 'Incidents', icon: Activity, badge: incidents.length, onClick: () => { setActiveTab('my-incidents'); loadMyIncidents(); } },
+    { id: 'tracking', label: 'Live Tracking', icon: Compass, badge: trackDispatch ? '●' : undefined, onClick: () => { setActiveTab('tracking'); loadActiveTracking(); } },
+    { id: 'assistance', label: 'Need Help?', icon: HeartHandshake, onClick: () => { setActiveTab('assistance'); captureAssistanceLocation(); } },
+    { id: 'profile', label: 'Settings', icon: Settings, onClick: () => { setActiveTab('profile'); loadProfileAndStats(); } }
+  ];
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-[#0b0f19] via-[#070b13] to-[#0d1323] flex flex-col font-inter">
-      {/* Top Navbar */}
-      <nav className="glass-panel border-b border-white/5 py-4 px-6 flex flex-col md:flex-row justify-between items-center gap-4 shadow-xl relative z-20">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600/10 text-blue-400 rounded-xl border border-blue-500/20 shadow-inner">
-            <AlertTriangle size={20} className="animate-pulse" />
-          </div>
-          <div>
-            <h1 className="text-lg font-black tracking-tight text-white leading-tight">Emergency Portal</h1>
-            <p className="text-[11px] text-gray-400">Welcome, <span className="text-blue-400 font-semibold">{user.name}</span> (Citizen)</p>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-between w-full md:w-auto gap-4">
-          <div className="flex flex-wrap bg-white/5 p-1 rounded-xl border border-white/10 shadow-inner">
-            <button
-              onClick={() => setActiveTab('report')}
-              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'report' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <AlertTriangle size={13} />
-              Report
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('my-incidents');
-                loadMyIncidents();
-              }}
-              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'my-incidents' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Activity size={13} />
-              Incidents ({incidents.length})
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('tracking');
-                loadActiveTracking();
-              }}
-              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 relative ${activeTab === 'tracking' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Compass size={13} />
-              Live Tracking
-              {trackDispatch && (
-                <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
-                </span>
-              )}
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('assistance');
-                captureAssistanceLocation();
-              }}
-              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'assistance' ? 'bg-rose-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <HeartHandshake size={13} />
-              Need Help?
-            </button>
-            <button
-              onClick={() => {
-                setActiveTab('profile');
-                loadProfileAndStats();
-              }}
-              className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all duration-200 flex items-center gap-1.5 ${activeTab === 'profile' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
-            >
-              <Settings size={13} />
-              Settings
-            </button>
-          </div>
-
-          <button onClick={onLogout} className="p-2.5 rounded-xl bg-white/5 border border-white/10 text-gray-400 hover:text-red-400 hover:border-red-500/20 hover:bg-red-500/5 transition-all" title="Log Out">
-            <Power size={18} />
-          </button>
-        </div>
-      </nav>
-
-      {/* Main Dashboard Area */}
-      <main className="flex-1 w-full max-w-none px-6 py-6 flex flex-col lg:h-[calc(100vh-80px)] lg:overflow-hidden">
+    <DashboardShell
+      icon={AlertTriangle}
+      iconClassName="bg-blue-600/10 text-blue-400 border-blue-500/20"
+      title="Emergency Portal"
+      subtitle={`Welcome, ${user.name} (Citizen)`}
+      tabs={citizenTabs}
+      activeTab={activeTab}
+      onLogout={onLogout}
+    >
         {activeTab === 'report' && (
           <>
           <button
@@ -538,7 +491,7 @@ export default function CitizenDashboard({ user, onLogout }) {
             </span>
           </button>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch flex-1 min-h-0">
+          <div className="content-grid">
             {/* Left side: Report form */}
             <div className="lg:col-span-5 glass-panel p-6 rounded-2xl flex flex-col justify-between overflow-y-auto max-h-[90vh] lg:max-h-full">
               <div className="space-y-4">
@@ -648,7 +601,7 @@ export default function CitizenDashboard({ user, onLogout }) {
             </div>
 
             {/* Right side: Map picker */}
-            <div className="lg:col-span-7 glass-panel p-4 rounded-2xl flex flex-col h-[400px] lg:h-full">
+            <div className="lg:col-span-7 map-panel-wrap">
               <div className="mb-2 flex flex-col sm:flex-row justify-between sm:items-center gap-1 px-2 pb-1.5">
                 <span className="text-xs font-bold text-gray-300">Map Location Picker</span>
                 <span className="text-[10px] text-gray-500 uppercase tracking-wider">Click anywhere on the map to set manual location</span>
@@ -747,7 +700,7 @@ export default function CitizenDashboard({ user, onLogout }) {
         )}
 
         {activeTab === 'tracking' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full items-stretch flex-1 overflow-hidden">
+          <div className="content-grid">
             {/* Left side: Track Status & Details */}
             <div className="lg:col-span-4 glass-panel p-5 rounded-2xl flex flex-col justify-between overflow-y-auto max-h-[85vh] lg:max-h-full">
               {loadingTrack ? (
@@ -850,7 +803,7 @@ export default function CitizenDashboard({ user, onLogout }) {
             </div>
 
             {/* Right side: Realtime Leaflet Map */}
-            <div className="lg:col-span-8 glass-panel p-4 rounded-2xl flex flex-col h-[400px] lg:h-full overflow-hidden">
+            <div className="lg:col-span-8 map-panel-wrap">
               <div className="mb-2 flex flex-col sm:flex-row justify-between sm:items-center gap-1 px-2 pb-1.5">
                 <span className="text-xs font-bold text-gray-300">Live Navigation Map</span>
                 <span className="text-[10px] text-gray-500 uppercase tracking-wider">
@@ -874,7 +827,7 @@ export default function CitizenDashboard({ user, onLogout }) {
         )}
 
         {activeTab === 'assistance' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 overflow-y-auto max-h-[85vh] lg:max-h-full">
+          <div className="content-grid">
             <div className="lg:col-span-5 glass-panel p-6 rounded-2xl flex flex-col overflow-y-auto">
               <div className="mb-5">
                 <span className="text-[10px] uppercase font-bold tracking-wider text-rose-400">Emergency Assistance</span>
@@ -996,7 +949,7 @@ export default function CitizenDashboard({ user, onLogout }) {
               </div>
             </div>
 
-            <div className="lg:col-span-7 glass-panel p-4 rounded-2xl flex flex-col h-[420px] lg:h-full">
+            <div className="lg:col-span-7 map-panel-wrap">
               <div className="mb-2 flex flex-col sm:flex-row justify-between sm:items-center gap-1 px-2 pb-1.5">
                 <span className="text-xs font-bold text-gray-300">Confirm Location</span>
                 <span className="text-[10px] text-gray-500 uppercase tracking-wider">Tap the map to adjust coordinates before calling admin</span>
@@ -1015,7 +968,7 @@ export default function CitizenDashboard({ user, onLogout }) {
         )}
 
         {activeTab === 'profile' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full items-stretch flex-1 overflow-y-auto max-h-[85vh] lg:max-h-full">
+          <div className="content-grid">
             {/* Left side: Profile Edit form */}
             <div className="lg:col-span-7 glass-panel p-6 rounded-2xl flex flex-col">
               <div className="mb-4">
@@ -1090,16 +1043,17 @@ export default function CitizenDashboard({ user, onLogout }) {
                       </div>
                     </div>
 
-                    <div>
-                      <label className="block text-[10px] uppercase font-bold tracking-wider text-gray-400 mb-1.5">New Password (Leave blank to keep current)</label>
-                      <input
-                        type="password"
-                        value={profilePassword}
-                        onChange={(e) => setProfilePassword(e.target.value)}
-                        placeholder="••••••••"
-                        className="w-full px-4 py-2.5 rounded-xl glass-input text-white text-sm focus:border-blue-500 shadow-inner"
-                      />
-                    </div>
+                    <PasswordInput
+                      id="citizen-profile-password"
+                      label="New Password (Leave blank to keep current)"
+                      value={profilePassword}
+                      onChange={(e) => setProfilePassword(e.target.value)}
+                      placeholder="Enter new password"
+                      showIcon={false}
+                      labelClassName="block text-[10px] uppercase font-bold tracking-wider text-gray-400 mb-1.5"
+                      inputClassName="text-sm py-2.5"
+                      autoComplete="new-password"
+                    />
                   </div>
 
                   <button
@@ -1158,7 +1112,7 @@ export default function CitizenDashboard({ user, onLogout }) {
             </div>
           </div>
         )}
-      </main>
-    </div>
+
+    </DashboardShell>
   );
 }
