@@ -78,11 +78,15 @@ export const serviceAPI = {
   updateProfile: (serviceId, data) => api.put(`/services/${serviceId}/profile`, data),
   getStats: (serviceId) => api.get(`/services/${serviceId}/stats`),
   getHistory: (serviceId, params) => api.get(`/services/${serviceId}/history`, { params }),
+  getSimulationSpeed: () => api.get('/simulation-speed'),
+  adjustSimulationSpeed: (delta) => api.post('/simulation-speed', { delta }),
 };
 
 export const trafficAPI = {
   getActiveCorridors: () => api.get('/traffic/active-corridors'),
   getTrackingHistory: () => api.get('/traffic/tracking-history'),
+  getJourneyStats: (params) => api.get('/traffic/journey-stats', { params }),
+  getJourneyHistory: (params) => api.get('/traffic/journey-history', { params }),
 };
 
 export default api;

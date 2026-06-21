@@ -5,6 +5,7 @@ import MapPanel from '../components/MapPanel';
 import DashboardShell from '../components/DashboardShell';
 import PasswordInput from '../components/PasswordInput';
 import FleetManager from '../components/FleetManager';
+import SimulationSpeedControls from '../components/SimulationSpeedControls';
 import { 
   ShieldAlert, Truck, Send, CheckCircle2, Play, MapPin, Clock, 
   Navigation, Settings, BarChart2, List, Search, Calendar, 
@@ -576,6 +577,7 @@ export default function HospitalDashboard({ user, onLogout }) {
                             <div className="p-3 bg-emerald-500/5 border border-emerald-500/20 rounded-xl text-center text-xs text-emerald-400 font-bold animate-pulse shadow-inner">
                               Priority Green Corridor Override Engaged. GPS Simulation active...
                             </div>
+                            <SimulationSpeedControls active />
                             <button
                               onClick={() => handleSetAtScene(activeDispatch.id)}
                               className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-500 transition text-xs font-bold text-white flex items-center justify-center gap-1.5 shadow-lg active:scale-[0.98]"
@@ -595,8 +597,11 @@ export default function HospitalDashboard({ user, onLogout }) {
                         )}
 
                         {activeDispatch.status === 'returning' && (
-                          <div className="p-3 bg-amber-500/5 border border-amber-500/20 rounded-xl text-center text-xs text-amber-400 font-bold shadow-inner">
-                            Ambulance is returning to station...
+                          <div className="space-y-3">
+                            <div className="p-3 bg-amber-500/5 border border-amber-500/20 rounded-xl text-center text-xs text-amber-400 font-bold shadow-inner">
+                              Ambulance is returning to station...
+                            </div>
+                            <SimulationSpeedControls active />
                           </div>
                         )}
                       </div>

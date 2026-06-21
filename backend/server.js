@@ -1346,6 +1346,216 @@ app.get('/api/traffic/tracking-history', authenticateJWT, async (req, res) => {
   }
 });
 
+function buildTrafficJourneyDateFilter(filter) {
+  const completedTimeExpr = `COALESCE(
+    (SELECT MAX(event_time) FROM incident_timeline it WHERE it.incident_id = d.incident_id AND it.event_type = 'completed'),
+    d.created_at
+  )`;
+
+  if (filter === 'today') {
+    return `AND ${completedTimeExpr} >= CURDATE()`;
+  }
+  if (filter === '7days') {
+    return `AND ${completedTimeExpr} >= DATE_SUB(NOW(), INTERVAL 7 DAY)`;
+  }
+  if (filter === '30days') {
+    return `AND ${completedTimeExpr} >= DATE_SUB(NOW(), INTERVAL 30 DAY)`;
+  }
+  return '';
+}
+
+function buildCompletedJourneyBaseQuery() {
+  return `
+    FROM dispatches d
+    JOIN services s ON d.service_id = s.id
+    JOIN vehicles v ON d.vehicle_id = v.id
+    LEFT JOIN (
+      SELECT incident_id, MIN(event_time) as en_route_time
+      FROM incident_timeline
+      WHERE event_type = 'en_route'
+      GROUP BY incident_id
+    ) en_route_events ON en_route_events.incident_id = d.incident_id
+    LEFT JOIN (
+      SELECT incident_id, MAX(event_time) as completed_time
+      FROM incident_timeline
+      WHERE event_type = 'completed'
+      GROUP BY incident_id
+    ) completed_events ON completed_events.incident_id = d.incident_id
+    WHERE d.status = 'completed' AND d.vehicle_id IS NOT NULL
+  `;
+}
+
+function mapJourneyRow(row) {
+  const optimizedTravelTime = row.optimized_travel_time || 0;
+  const normalTravelTime = row.normal_travel_time || optimizedTravelTime + (row.time_saved || 0);
+  const timeSaved = row.time_saved ?? (normalTravelTime - optimizedTravelTime);
+
+  return {
+    journey_id: row.journey_id,
+    incident_id: row.incident_id,
+    vehicle_id: row.vehicle_id,
+    vehicle_type: row.vehicle_type,
+    service_name: row.service_name,
+    start_time: row.start_time,
+    end_time: row.end_time,
+    optimized_travel_time: optimizedTravelTime,
+    normal_travel_time: normalTravelTime,
+    time_saved: timeSaved,
+    corridor_status: row.corridor_status
+  };
+}
+
+// Completed corridor journey statistics
+app.get('/api/traffic/journey-stats', authenticateJWT, authorizeRoles('traffic_admin'), async (req, res) => {
+  const { filter = 'all' } = req.query;
+
+  try {
+    const dateFilter = buildTrafficJourneyDateFilter(filter);
+    const [rows] = await db.query(
+      `SELECT
+         d.id as journey_id,
+         d.optimized_eta as optimized_travel_time,
+         d.normal_eta as normal_travel_time,
+         (d.normal_eta - d.optimized_eta) as time_saved
+       ${buildCompletedJourneyBaseQuery()}
+       ${dateFilter}`
+    );
+
+    const totalOptimizedTravelTime = rows.reduce((sum, row) => sum + (row.optimized_travel_time || 0), 0);
+    const totalNormalTravelTime = rows.reduce((sum, row) => {
+      const optimized = row.optimized_travel_time || 0;
+      const normal = row.normal_travel_time || optimized + (row.time_saved || 0);
+      return sum + normal;
+    }, 0);
+    const totalTimeSaved = totalNormalTravelTime - totalOptimizedTravelTime;
+
+    res.json({
+      totalOptimizedTravelTime,
+      totalNormalTravelTime,
+      totalTimeSaved,
+      totalCompletedCorridors: rows.length,
+      filter
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Completed corridor journey history
+app.get('/api/traffic/journey-history', authenticateJWT, authorizeRoles('traffic_admin'), async (req, res) => {
+  const {
+    filter = 'all',
+    search = '',
+    page = '1',
+    limit = '10',
+    sort = 'end_time',
+    order = 'desc'
+  } = req.query;
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+  const offset = (pageNum - 1) * limitNum;
+
+  const sortMap = {
+    journey_id: 'journey_id',
+    incident_id: 'incident_id',
+    vehicle_id: 'vehicle_id',
+    vehicle_type: 'vehicle_type',
+    service_name: 'service_name',
+    start_time: 'start_time',
+    end_time: 'end_time',
+    optimized_travel_time: 'optimized_travel_time',
+    normal_travel_time: 'normal_travel_time',
+    time_saved: 'time_saved',
+    corridor_status: 'corridor_status'
+  };
+  const sortCol = sortMap[sort] || 'end_time';
+  const sortOrder = order.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+  try {
+    const dateFilter = buildTrafficJourneyDateFilter(filter);
+    let searchFilter = '';
+    const searchParams = [];
+
+    if (search) {
+      searchFilter = `AND (
+        CAST(d.id AS CHAR) LIKE ? OR
+        CAST(d.incident_id AS CHAR) LIKE ? OR
+        d.vehicle_id LIKE ? OR
+        s.name LIKE ? OR
+        v.type LIKE ?
+      )`;
+      const searchVal = `%${search}%`;
+      searchParams.push(searchVal, searchVal, searchVal, searchVal, searchVal);
+    }
+
+    const countQuery = `
+      SELECT COUNT(*) as total
+      ${buildCompletedJourneyBaseQuery()}
+      ${dateFilter}
+      ${searchFilter}
+    `;
+    const [countRows] = await db.query(countQuery, searchParams);
+    const total = countRows[0]?.total || 0;
+
+    const dataQuery = `
+      SELECT
+        d.id as journey_id,
+        d.incident_id,
+        d.vehicle_id,
+        v.type as vehicle_type,
+        s.name as service_name,
+        COALESCE(en_route_events.en_route_time, d.created_at) as start_time,
+        completed_events.completed_time as end_time,
+        d.optimized_eta as optimized_travel_time,
+        d.normal_eta as normal_travel_time,
+        (d.normal_eta - d.optimized_eta) as time_saved,
+        d.status as corridor_status
+      ${buildCompletedJourneyBaseQuery()}
+      ${dateFilter}
+      ${searchFilter}
+      ORDER BY ${sortCol} ${sortOrder}
+      LIMIT ? OFFSET ?
+    `;
+    const [rows] = await db.query(dataQuery, [...searchParams, limitNum, offset]);
+
+    res.json({
+      items: rows.map(mapJourneyRow),
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limitNum))
+      },
+      filter
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error.' });
+  }
+});
+
+// Simulation speed controls for hospital/fire operators (demo only)
+app.get('/api/simulation-speed', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), (req, res) => {
+  res.json({ speedKmh: socketModule.getSimulationSpeedKmh() });
+});
+
+app.post('/api/simulation-speed', authenticateJWT, authorizeRoles('hospital_user', 'fire_station_user'), (req, res) => {
+  const { delta, speedKmh } = req.body;
+  const parsedSpeed = Number(speedKmh);
+  const parsedDelta = Number(delta);
+
+  if (Number.isFinite(parsedSpeed)) {
+    return res.json({ speedKmh: socketModule.setSimulationSpeedKmh(parsedSpeed) });
+  }
+  if (Number.isFinite(parsedDelta)) {
+    return res.json({ speedKmh: socketModule.adjustSimulationSpeed(parsedDelta) });
+  }
+
+  return res.status(400).json({ error: 'Provide delta or speedKmh.' });
+});
+
 // Get Citizen profile details
 app.get('/api/citizen/profile', authenticateJWT, authorizeRoles('citizen_user'), async (req, res) => {
   try {

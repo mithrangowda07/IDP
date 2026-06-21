@@ -9,10 +9,39 @@ let io;
 const activeSimulations = {}; // dispatchId -> intervalInfo
 const SIGNAL_CLEARANCE_DISTANCE_METERS = 500;
 const SIGNAL_PASSED_PERSIST_DISTANCE_METERS = 60;
-const SIGNAL_ROUTE_MATCH_DISTANCE_METERS = parseInt(process.env.SIGNAL_ROUTE_MATCH_DISTANCE_METERS || '75', 10);
+const SIGNAL_ROUTE_MATCH_DISTANCE_METERS = parseInt(process.env.SIGNAL_ROUTE_MATCH_DISTANCE_METERS || '15', 10);
 const SIGNAL_DEDUPE_DISTANCE_METERS = 75;
 const VEHICLE_STEP_DISTANCE_METERS = 25;
 const VEHICLE_TRACKING_INTERVAL_MS = 1000;
+const DEFAULT_SIMULATION_SPEED_KMH = (VEHICLE_STEP_DISTANCE_METERS / VEHICLE_TRACKING_INTERVAL_MS) * 3600;
+const SIMULATION_SPEED_MIN_KMH = 10;
+const SIMULATION_SPEED_MAX_KMH = 120;
+let globalSimulationSpeedKmh = parseFloat(process.env.SIMULATION_SPEED_KMH || String(DEFAULT_SIMULATION_SPEED_KMH));
+
+function getSimulationStepMeters() {
+  return (globalSimulationSpeedKmh / 3.6) * (VEHICLE_TRACKING_INTERVAL_MS / 1000);
+}
+
+function getSimulationSpeedKmh() {
+  return globalSimulationSpeedKmh;
+}
+
+function setSimulationSpeedKmh(speedKmh) {
+  globalSimulationSpeedKmh = Math.max(
+    SIMULATION_SPEED_MIN_KMH,
+    Math.min(SIMULATION_SPEED_MAX_KMH, speedKmh)
+  );
+  if (io) {
+    io.to('hospital_user').to('fire_station_user').emit('simulation_speed_update', {
+      speedKmh: globalSimulationSpeedKmh
+    });
+  }
+  return globalSimulationSpeedKmh;
+}
+
+function adjustSimulationSpeed(deltaKmh) {
+  return setSimulationSpeedKmh(globalSimulationSpeedKmh + deltaKmh);
+}
 const PRIMARY_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.openstreetmap.fr/api/interpreter',
@@ -207,10 +236,26 @@ function getSignalRouteMatch(signalPoint, route, routeDistances) {
     const distanceToRoute = getPointToSegmentDistanceMeters(signalPoint, segmentStart, segmentEnd, originLat);
 
     if (distanceToRoute < bestMatch.distanceToRoute) {
+      const p = projectToMeters(signalPoint, originLat);
+      const a = projectToMeters(segmentStart, originLat);
+      const b = projectToMeters(segmentEnd, originLat);
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      let projectionRatio = 0;
+      if (dx !== 0 || dy !== 0) {
+        projectionRatio = Math.max(
+          0,
+          Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy))
+        );
+      }
+      const previousDistance = routeDistances[i - 1];
+      const nextDistance = routeDistances[i];
+      const distanceAlongRoute = previousDistance + projectionRatio * (nextDistance - previousDistance);
+
       bestMatch = {
         distanceToRoute,
         routeIndex: i,
-        distanceAlongRoute: routeDistances[i]
+        distanceAlongRoute
       };
     }
   }
@@ -218,7 +263,7 @@ function getSignalRouteMatch(signalPoint, route, routeDistances) {
   return bestMatch;
 }
 
-function getRouteBoundingBox(route, paddingDegrees = 0.003) {
+function getRouteBoundingBox(route, paddingDegrees = Math.max(0.0002, SIGNAL_ROUTE_MATCH_DISTANCE_METERS / 111320)) {
   const coordinates = route.map(toRoutePoint);
   const lats = coordinates.map(point => point.lat);
   const lngs = coordinates.map(point => point.lng);
@@ -667,7 +712,7 @@ async function startTrackingSimulation(dispatchId) {
     const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
 
     const intervalId = setInterval(async () => {
-      vehicleDistance = Math.min(vehicleDistance + VEHICLE_STEP_DISTANCE_METERS, totalRouteDistance);
+      vehicleDistance = Math.min(vehicleDistance + getSimulationStepMeters(), totalRouteDistance);
       const pt = getRoutePointAtDistance(route, routeDistances, vehicleDistance);
       if (!pt) return;
       const progress = totalRouteDistance > 0 ? (vehicleDistance / totalRouteDistance) * 100 : 100;
@@ -877,7 +922,7 @@ async function startReturnSimulation(dispatchId, needGreenCorridor = true) {
     const totalRouteDistance = routeDistances[routeDistances.length - 1] || 0;
 
     const intervalId = setInterval(async () => {
-      vehicleDistance = Math.min(vehicleDistance + VEHICLE_STEP_DISTANCE_METERS, totalRouteDistance);
+      vehicleDistance = Math.min(vehicleDistance + getSimulationStepMeters(), totalRouteDistance);
       const pt = getRoutePointAtDistance(returnRoute, routeDistances, vehicleDistance);
       if (!pt) return;
       const progress = totalRouteDistance > 0 ? (vehicleDistance / totalRouteDistance) * 100 : 100;
@@ -979,5 +1024,8 @@ module.exports = {
   broadcastVehicleDispatched,
   startTrackingSimulation,
   startReturnSimulation,
-  stopTrackingSimulation
+  stopTrackingSimulation,
+  getSimulationSpeedKmh,
+  setSimulationSpeedKmh,
+  adjustSimulationSpeed
 };
