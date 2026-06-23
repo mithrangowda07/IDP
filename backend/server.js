@@ -524,6 +524,24 @@ app.post('/api/sensors/alert', async (req, res) => {
   }
 
   try {
+    // Check for duplicate alerts within the last 10 minutes (600 seconds)
+    const [duplicates] = await db.query(
+      `SELECT id FROM incidents 
+       WHERE type = ? 
+         AND ABS(latitude - ?) < 0.0001 
+         AND ABS(longitude - ?) < 0.0001 
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)`,
+      [formattedType, parseFloat(latitude), parseFloat(longitude)]
+    );
+
+    if (duplicates.length > 0) {
+      console.log(`[Sensor Alert] Duplicate alert of type "${formattedType}" at (${latitude}, ${longitude}) detected within the last 10 minutes. Ignoring.`);
+      return res.status(200).json({
+        message: 'Duplicate alert detected. Ignored.',
+        isDuplicate: true
+      });
+    }
+
     const description = `Sensor triggered alert of type "${alert_type}" at timestamp ${timestamp || new Date().toISOString()}`;
     const [incidentResult] = await db.query(
       'INSERT INTO incidents (type, latitude, longitude, description, source, reporter_id, status) VALUES (?, ?, ?, ?, "sensor", NULL, "reported")',

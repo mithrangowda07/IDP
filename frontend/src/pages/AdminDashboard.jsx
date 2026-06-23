@@ -431,7 +431,19 @@ export default function AdminDashboard({ user, onLogout }) {
                       className={`p-3.5 rounded-xl border transition-all duration-200 cursor-pointer text-left ${selectedIncident && selectedIncident.id === incident.id ? 'bg-blue-600/10 border-blue-500/40 shadow-inner' : 'bg-white/5 border-white/5 hover:border-white/10 hover:bg-white/[0.02]'}`}
                     >
                       <div className="flex justify-between items-start">
-                        <span className="text-[9px] text-gray-400 font-bold uppercase tracking-wider">ID: #{incident.id}</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[9px] text-gray-400 font-bold uppercase tracking-wider">ID: #{incident.id}</span>
+                          {incident.source === 'sensor' && (
+                            <span className="text-[8px] bg-red-500/10 border border-red-500/20 text-red-400 px-1 rounded font-bold uppercase tracking-wider">
+                              Sensor
+                            </span>
+                          )}
+                          {incident.source === 'citizen' && (
+                            <span className="text-[8px] bg-blue-500/10 border border-blue-500/20 text-blue-400 px-1 rounded font-bold uppercase tracking-wider">
+                              Citizen
+                            </span>
+                          )}
+                        </div>
                         <span className={`px-1.5 py-0.5 border rounded-full text-[8px] font-black uppercase leading-none tracking-wider ${getStatusColor(incident.status)}`}>
                           {incident.status.replace('_', ' ')}
                         </span>
