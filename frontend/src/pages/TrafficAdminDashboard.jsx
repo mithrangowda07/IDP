@@ -3,6 +3,7 @@ import { trafficAPI } from '../services/api';
 import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
 import DashboardShell from '../components/DashboardShell';
+import ConflictSimulationLab from './ConflictSimulationLab';
 import { ShieldAlert, Activity, Navigation, ChevronLeft, ChevronRight } from 'lucide-react';
 
 const HISTORY_FILTERS = [
@@ -37,6 +38,7 @@ function formatVehicleType(type) {
 }
 
 export default function TrafficAdminDashboard({ user, onLogout }) {
+  const [activeTab, setActiveTab] = useState('corridor_control');
   const [activeCorridors, setActiveCorridors] = useState([]);
   const [trackingHistory, setTrackingHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -221,6 +223,18 @@ export default function TrafficAdminDashboard({ user, onLogout }) {
     if (historySort.sort !== columnKey) return '';
     return historySort.order === 'asc' ? ' ↑' : ' ↓';
   };
+  const tabs = [
+    {
+      id: 'corridor_control',
+      label: 'Green Corridor Control',
+      onClick: () => setActiveTab('corridor_control'),
+    },
+    {
+      id: 'conflict_lab',
+      label: 'Conflict Simulation Lab',
+      onClick: () => setActiveTab('conflict_lab'),
+    },
+  ];
 
   return (
     <DashboardShell
@@ -228,10 +242,12 @@ export default function TrafficAdminDashboard({ user, onLogout }) {
       iconClassName="bg-emerald-600/10 text-emerald-400 border-emerald-500/20"
       title="Traffic Control Authority"
       subtitle="Green Corridor Optimization & Signal Overrides"
-      tabs={[]}
+      tabs={tabs}
+      activeTab={activeTab}
       onLogout={onLogout}
     >
-      <div className="flex flex-col gap-4 sm:gap-6 min-h-0">
+      {activeTab === 'corridor_control' ? (
+        <div className="flex flex-col gap-4 sm:gap-6 min-h-0">
         <div className="stat-grid lg:grid-cols-4">
           <div className="stat-card flex-col items-start justify-between border-emerald-500/10">
             <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Total Optimized Travel Time</span>
@@ -463,6 +479,9 @@ export default function TrafficAdminDashboard({ user, onLogout }) {
           </div>
         </div>
       </div>
+      ) : (
+        <ConflictSimulationLab />
+      )}
     </DashboardShell>
   );
 }
