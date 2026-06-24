@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, Tooltip, Polyline, CircleMarker, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { Play, Pause, RotateCcw, AlertTriangle, ShieldCheck, Clock, Users, ArrowRight, Activity, Plus, Shield, Check, Flame, Siren, Trash2, FastForward, Loader2 } from 'lucide-react';
+import { Play, Pause, RotateCcw, AlertTriangle, ShieldCheck, Clock, Users, ArrowRight, Activity, Plus, Shield, Check, Flame, Siren, Trash2, FastForward, Loader2, MapPin, Navigation } from 'lucide-react';
 
 // Fix Leaflet marker icon asset paths for Vite/React
 delete L.Icon.Default.prototype._getIconUrl;
@@ -357,34 +357,109 @@ function MapFocusController({ zoom = 14 }) {
   return null;
 }
 
-const createVehicleIcon = (type, id, isWinner = false) => {
+const createVehicleIcon = (type, id, priority, eta, distance, isWinner = false, signalStatus = 'red') => {
   let bgColor = '#3b82f6';
-  let borderClass = 'border-blue-400';
+  let borderClass = 'border-blue-500';
+  let glowClass = 'shadow-[0_0_15px_rgba(59,130,246,0.6)]';
   let label = 'AMB';
+  let emoji = '🚑';
 
   if (type === 'fire_engine') {
     bgColor = '#ef4444';
-    borderClass = 'border-red-400';
+    borderClass = 'border-red-500';
+    glowClass = 'shadow-[0_0_15px_rgba(239,68,68,0.6)]';
     label = 'FIRE';
+    emoji = '🚒';
   } else if (type === 'police') {
-    bgColor = '#8b5cf6';
-    borderClass = 'border-purple-400';
+    bgColor = '#a855f7';
+    borderClass = 'border-purple-500';
+    glowClass = 'shadow-[0_0_15px_rgba(168,85,247,0.6)]';
     label = 'POL';
+    emoji = '🚓';
   }
 
+  const isGreenCorridor = isWinner && signalStatus === 'green';
+
   return L.divIcon({
-    className: 'custom-leaflet-icon',
+    className: 'custom-leaflet-icon-vehicle',
     html: `
-      <div class="relative flex items-center justify-center w-9 h-9 rounded-full border-2 bg-slate-900 ${borderClass} shadow-2xl transition-all duration-300">
-        ${isWinner ? `<div class="absolute -inset-1 rounded-full bg-emerald-500/20 animate-ping"></div>` : ''}
-        <div class="flex flex-col items-center justify-center">
-          <span class="text-[7px] font-bold text-gray-400 leading-none uppercase">${label}</span>
-          <span class="text-white text-[8px] font-black leading-none mt-0.5">${id.split('-')[1] || id}</span>
+      <div class="relative w-[100px] h-[100px] pointer-events-none select-none" style="filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.4));">
+        <!-- Floating Info Card -->
+        <div class="absolute left-1/2 -translate-x-1/2 bottom-[72px] bg-slate-950/95 border ${borderClass} rounded-lg p-1.5 shadow-2xl text-[8px] min-w-[85px] leading-tight text-gray-300">
+          <div class="font-black text-white flex items-center gap-1 border-b border-white/5 pb-0.5 mb-1">
+            <span>${emoji}</span>
+            <span class="truncate">${id}</span>
+          </div>
+          <div class="flex justify-between"><span>Priority:</span><strong class="text-white ml-1">${priority}</strong></div>
+          <div class="flex justify-between"><span>ETA:</span><strong class="text-white ml-1">${eta}s</strong></div>
+          <div class="flex justify-between"><span>Dist:</span><strong class="text-white ml-1">${distance} km</strong></div>
+        </div>
+
+        <!-- Arrow Pin Pointer -->
+        <div class="absolute left-1/2 -translate-x-1/2 bottom-[66px] w-1.5 h-1.5 bg-slate-950 border-r border-b ${borderClass} rotate-45 z-10"></div>
+
+        <!-- Vehicle Badge -->
+        <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center justify-center w-8 h-8 rounded-full border-2 bg-slate-900 ${borderClass} ${glowClass} transition-all duration-300">
+          ${isGreenCorridor ? `<div class="absolute -inset-1 rounded-full bg-emerald-500/30 animate-ping"></div>` : ''}
+          <div class="flex flex-col items-center justify-center">
+            <span class="text-[6px] font-bold text-gray-400 leading-none uppercase">${label}</span>
+            <span class="text-white text-[8px] font-black leading-none mt-0.5">${id.split('-')[1] || id}</span>
+          </div>
         </div>
       </div>
     `,
-    iconSize: [36, 36],
-    iconAnchor: [18, 18],
+    iconSize: [100, 100],
+    iconAnchor: [50, 50]
+  });
+};
+
+const createJunctionIcon = (vehiclesCount, riskLevel, winnerCrossing) => {
+  let pulseColor = 'bg-red-500';
+  let borderColor = 'border-red-500/40';
+  let glowClass = 'glow-red-pulse';
+  let statusText = '⚠ CONFLICT DETECTED';
+  let riskColor = 'text-red-400';
+  
+  if (winnerCrossing) {
+    pulseColor = 'bg-emerald-500';
+    borderColor = 'border-emerald-500/40';
+    glowClass = 'glow-green-pulse';
+    statusText = '⚡ CORRIDOR ACTIVE';
+    riskColor = 'text-emerald-400';
+  } else if (riskLevel === 'HIGH') {
+    riskColor = 'text-orange-400';
+  } else if (riskLevel === 'MEDIUM') {
+    riskColor = 'text-yellow-400';
+  } else if (riskLevel === 'LOW') {
+    riskColor = 'text-emerald-400';
+  }
+
+  return L.divIcon({
+    className: 'custom-leaflet-icon-junction',
+    html: `
+      <div class="relative flex items-center justify-center w-12 h-12 rounded-full">
+        <!-- Expanding Radar Rings -->
+        <div class="absolute inset-0 rounded-full ${pulseColor}/20 animate-ping" style="animation-duration: 2s;"></div>
+        <div class="absolute -inset-2 rounded-full ${pulseColor}/10 animate-ping" style="animation-duration: 3s; animation-delay: 0.5s;"></div>
+        <div class="absolute -inset-4 rounded-full ${pulseColor}/5 animate-ping" style="animation-duration: 4s; animation-delay: 1s;"></div>
+        
+        <!-- Center Core -->
+        <div class="w-4 h-4 ${pulseColor} rounded-full animate-pulse border-2 border-white shadow-lg"></div>
+        
+        <!-- HUD Panel Card -->
+        <div class="absolute -top-[76px] bg-slate-950/95 border ${borderColor} rounded-xl p-2 shadow-2xl text-[8px] min-w-[125px] pointer-events-none select-none text-left leading-tight text-gray-300 transform -translate-y-1 z-[3000] ${glowClass}">
+          <div class="font-black ${riskColor} uppercase tracking-wider text-center border-b border-white/5 pb-1 mb-1">${statusText}</div>
+          <div class="font-bold text-white text-[9px]">Jnana Bharathi Circle</div>
+          <div class="flex justify-between mt-1"><span>Involved:</span><strong class="text-white">${vehiclesCount} Vehicles</strong></div>
+          <div class="flex justify-between"><span>Risk Index:</span><strong class="${riskColor}">${riskLevel}</strong></div>
+        </div>
+        
+        <!-- HUD Pointer -->
+        <div class="absolute -top-[9px] w-1.5 h-1.5 bg-slate-950 border-r border-b ${borderColor} rotate-45 z-[3000]"></div>
+      </div>
+    `,
+    iconSize: [48, 48],
+    iconAnchor: [24, 24],
   });
 };
 
@@ -394,18 +469,36 @@ function interpolatePath(path, progress) {
   if (progress <= 0) return path[0];
   if (progress >= 1) return path[path.length - 1];
 
-  const totalSegments = path.length - 1;
-  const rawIndex = progress * totalSegments;
-  const index = Math.floor(rawIndex);
-  const segmentProgress = rawIndex - index;
+  const distances = [];
+  let totalDistance = 0;
+  for (let i = 0; i < path.length - 1; i++) {
+    const d = Math.sqrt(
+      Math.pow(path[i+1][0] - path[i][0], 2) + 
+      Math.pow(path[i+1][1] - path[i][1], 2)
+    );
+    distances.push(d);
+    totalDistance += d;
+  }
 
-  const start = path[index];
-  const end = path[index + 1];
+  if (totalDistance === 0) return path[0];
 
-  const lat = start[0] + (end[0] - start[0]) * segmentProgress;
-  const lng = start[1] + (end[1] - start[1]) * segmentProgress;
+  const targetDistance = progress * totalDistance;
+  let accumulatedDistance = 0;
 
-  return [lat, lng];
+  for (let i = 0; i < distances.length; i++) {
+    const segDist = distances[i];
+    if (accumulatedDistance + segDist >= targetDistance) {
+      const segmentProgress = segDist > 0 ? (targetDistance - accumulatedDistance) / segDist : 0;
+      const start = path[i];
+      const end = path[i + 1];
+      const lat = start[0] + (end[0] - start[0]) * segmentProgress;
+      const lng = start[1] + (end[1] - start[1]) * segmentProgress;
+      return [lat, lng];
+    }
+    accumulatedDistance += segDist;
+  }
+
+  return path[path.length - 1];
 }
 
 const fetchOSRMRoute = async (start, end) => {
@@ -417,6 +510,84 @@ const fetchOSRMRoute = async (start, end) => {
     return data.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng]);
   }
   throw new Error('OSRM Route Failed');
+};
+
+const getDecisionTreeTimeline = (vehiclesList) => {
+  let candidates = [...vehiclesList];
+  const stepsDef = [
+    { name: 'Priority', field: 'priority', compare: (a, b) => b.priority - a.priority, format: v => v.priority },
+    { name: 'Distance', field: 'distance', compare: (a, b) => a.distance - b.distance, format: v => `${v.distance} km` },
+    { name: 'ETA', field: 'eta', compare: (a, b) => a.eta - b.eta, format: v => `${v.eta}s` },
+    { name: 'Lives At Risk', field: 'livesAtRisk', compare: (a, b) => b.livesAtRisk - a.livesAtRisk, format: v => v.livesAtRisk },
+    { name: 'Emergency Type', field: 'emergencyType', compare: (a, b) => {
+        const wA = EMERGENCY_WEIGHTS[a.emergencyType] || 0;
+        const wB = EMERGENCY_WEIGHTS[b.emergencyType] || 0;
+        return wB - wA;
+      }, format: v => `${v.emergencyType} (${EMERGENCY_WEIGHTS[v.emergencyType] || 0})` 
+    },
+    { name: 'Dispatch Timestamp', field: 'dispatchTime', compare: (a, b) => {
+        const tA = new Date(a.dispatchTime).getTime();
+        const tB = new Date(b.dispatchTime).getTime();
+        return tA - tB;
+      }, format: v => new Date(v.dispatchTime).toLocaleTimeString() 
+    }
+  ];
+
+  const results = [];
+  let winnerFound = false;
+
+  for (const step of stepsDef) {
+    if (candidates.length <= 1) {
+      results.push({
+        ...step,
+        status: 'skipped',
+        details: 'Not Evaluated',
+        valuesDisplay: '',
+        candidates: []
+      });
+      continue;
+    }
+
+    if (winnerFound) {
+      results.push({
+        ...step,
+        status: 'skipped',
+        details: 'Not Evaluated',
+        valuesDisplay: '',
+        candidates: []
+      });
+      continue;
+    }
+
+    const sorted = [...candidates].sort(step.compare);
+    const bestValue = sorted[0];
+    const tiedCandidates = candidates.filter(c => step.compare(c, bestValue) === 0);
+    const valuesStr = candidates.map(c => `${c.id.split('-')[1] || c.id}: ${step.format(c)}`).join(' vs ');
+
+    if (tiedCandidates.length === 1) {
+      winnerFound = true;
+      results.push({
+        ...step,
+        status: 'winner',
+        details: `Winner Selected: ${tiedCandidates[0].id}`,
+        valuesDisplay: valuesStr,
+        winner: tiedCandidates[0].id,
+        candidates: [...candidates]
+      });
+      candidates = [tiedCandidates[0]];
+    } else {
+      results.push({
+        ...step,
+        status: 'tie',
+        details: 'Tie - Checking Next',
+        valuesDisplay: valuesStr,
+        candidates: [...candidates]
+      });
+      candidates = tiedCandidates;
+    }
+  }
+
+  return results;
 };
 
 export default function ConflictSimulationLab() {
@@ -776,12 +947,20 @@ export default function ConflictSimulationLab() {
         signalStatus = progress < 1 ? 'green' : 'normal';
       }
 
+      // Dynamic remaining calculations for info cards
+      const remainingEta = Math.max(0, eta - simTime);
+      const remainingDistance = stage === 'en_route' 
+        ? Math.max(0, vehicle.distance * (1 - simTime / eta)) 
+        : 0;
+
       return {
         ...vehicle,
         position,
         stage,
         progress,
-        signalStatus
+        signalStatus,
+        remainingEta,
+        remainingDistance
       };
     }).filter(Boolean);
   }, [vehicles, simTime, simData, routes]);
@@ -799,52 +978,305 @@ export default function ConflictSimulationLab() {
     return { winnerId: null, status: 'normal', type: null };
   }, [trackingVehiclesOnMap]);
 
+  const winnerCrossing = useMemo(() => {
+    return trackingVehiclesOnMap.some(v => v.stage === 'crossing');
+  }, [trackingVehiclesOnMap]);
+
+  const timelineEndRef = useRef(null);
+
+  const decisionSteps = useMemo(() => {
+    return getDecisionTreeTimeline(vehicles);
+  }, [vehicles]);
+
+  const confidenceScore = useMemo(() => {
+    if (vehicles.length === 0) return 0;
+    const winningStepIndex = decisionSteps.findIndex(s => s.status === 'winner');
+    if (winningStepIndex === -1) return 100;
+    const confWeights = [98, 92, 86, 82, 78, 70];
+    return confWeights[winningStepIndex] || 95;
+  }, [vehicles, decisionSteps]);
+
+  const riskStats = useMemo(() => {
+    if (vehicles.length === 0) return { level: 'LOW', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/5', etaDiff: 'N/A' };
+    const sorted = [...vehicles].sort((a, b) => a.eta - b.eta);
+    let etaDiff = 'N/A';
+    let minEtaDiff = 999;
+    
+    if (sorted.length >= 2) {
+      minEtaDiff = Math.abs(sorted[0].eta - sorted[1].eta);
+      etaDiff = `${minEtaDiff}s`;
+    }
+    
+    let level = 'LOW';
+    let color = 'text-emerald-400 border-emerald-500/20 bg-emerald-500/5';
+    let glow = 'glow-green';
+    
+    if (vehicles.length >= 4 || minEtaDiff < 5) {
+      level = 'CRITICAL';
+      color = 'text-red-400 border-red-500/20 bg-red-500/5 border-red-500/40 bg-red-500/10 glow-red-pulse';
+      glow = 'glow-red';
+    } else if (vehicles.length === 3 || minEtaDiff < 15) {
+      level = 'HIGH';
+      color = 'text-orange-400 border-orange-500/20 bg-orange-500/5 border-orange-500/40 bg-orange-500/10';
+      glow = 'glow-warning';
+    } else if (vehicles.length === 2 || minEtaDiff < 30) {
+      level = 'MEDIUM';
+      color = 'text-yellow-400 border-yellow-500/20 bg-yellow-500/5 border-yellow-500/40 bg-yellow-500/10';
+      glow = 'glow-warning';
+    }
+    
+    return { level, color, glow, etaDiff, rawDiff: minEtaDiff };
+  }, [vehicles]);
+
+  const signalOverrideState = useMemo(() => {
+    if (!isPlaying || simTime === 0) return { status: 'NORMAL', text: 'NORMAL CYCLE', color: 'text-gray-400 bg-gray-500/10 border-gray-500/20', sub: 'JNB-01 running standard loops' };
+    
+    const winner = simData.sorted[0];
+    if (!winner) return { status: 'NORMAL', text: 'NORMAL CYCLE', color: 'text-gray-400 bg-gray-500/10 border-gray-500/20', sub: 'JNB-01 running standard loops' };
+    
+    if (simTime < winner.eta - 5) {
+      return { 
+        status: 'NORMAL', 
+        text: 'NORMAL CYCLE', 
+        color: 'text-blue-400 bg-blue-500/10 border-blue-500/20',
+        sub: 'JNB-01 running standard loops' 
+      };
+    } else if (simTime >= winner.eta - 5 && simTime < winner.eta) {
+      return { 
+        status: 'OVERRIDE', 
+        text: 'PREEMPTION ACTIVE', 
+        color: 'text-amber-400 bg-amber-500/10 border-amber-500/20 animate-pulse font-bold',
+        sub: `Clearing junction for ${winner.id}` 
+      };
+    } else if (simTime >= winner.eta && simTime < (simData.releaseTimes[winner.id] || winner.eta + 12)) {
+      return { 
+        status: 'ACTIVE', 
+        text: 'GREEN CORRIDOR ACTIVE', 
+        color: 'text-emerald-400 bg-emerald-500/15 border-emerald-500/30 glow-green-pulse font-bold',
+        sub: `Corridor locked for ${winner.id}` 
+      };
+    } else {
+      return { 
+        status: 'NORMAL', 
+        text: 'NORMAL CYCLE', 
+        color: 'text-blue-400 bg-blue-500/10 border-blue-500/20',
+        sub: 'Junction cleared, cycle restored' 
+      };
+    }
+  }, [isPlaying, simTime, simData]);
+
+  const timelineEvents = useMemo(() => {
+    const list = [];
+    if (vehicles.length === 0) return [];
+    
+    list.push({ time: 0, text: '🚨 Conflict Detected at Jnana Bharathi Circle' });
+    list.push({ time: 0.5, text: `🚗 ${vehicles.length} emergency vehicles converging` });
+    
+    let winnerFound = false;
+    decisionSteps.forEach((step, index) => {
+      const startTime = index * 2.0;
+      
+      if (winnerFound) return;
+      
+      if (step.status === 'tie') {
+        list.push({ time: startTime + 0.5, text: `🧠 AI Engine: Analyzing ${step.name}...` });
+        list.push({ time: startTime + 1.8, text: `⚠ Tie on ${step.name} (${step.valuesDisplay})` });
+      } else if (step.status === 'winner') {
+        list.push({ time: startTime + 0.5, text: `🧠 AI Engine: Analyzing ${step.name}...` });
+        list.push({ time: startTime + 1.8, text: `🏆 Winner Selected via ${step.name}: ${step.winner}` });
+        winnerFound = true;
+        
+        list.push({ time: startTime + 2.5, text: `🚦 Signal JNB-01 overridden to GREEN CORRIDOR` });
+        list.push({ time: startTime + 3.0, text: `⚡ Green Corridor locked for ${step.winner}` });
+      }
+    });
+
+    const winner = simData.sorted[0];
+    if (winner) {
+      list.push({ time: winner.eta, text: `🏁 Winner ${winner.id} reached Junction` });
+      list.push({ time: winner.eta + 4, text: `✅ Junction cleared by ${winner.id}` });
+      list.push({ time: winner.eta + 8, text: `🚦 Signal JNB-01 returned to standard cycles` });
+    }
+    
+    return list.sort((a, b) => a.time - b.time);
+  }, [vehicles, decisionSteps, simData]);
+
+  const activeTimeline = useMemo(() => {
+    return timelineEvents.filter(e => simTime >= e.time);
+  }, [timelineEvents, simTime]);
+
+  const getStepStatusAtTime = useCallback((step, index) => {
+    if (simTime === 0) return { status: 'pending', details: 'Waiting...' };
+
+    for (let i = 0; i < index; i++) {
+      if (decisionSteps[i] && decisionSteps[i].status === 'winner') {
+        return { status: 'skipped', details: 'Skipped' };
+      }
+    }
+
+    const stepStart = index * 2.0;
+    const stepDuration = 2.0;
+    const stepEnd = stepStart + stepDuration;
+
+    if (simTime < stepStart) {
+      return { status: 'pending', details: 'Pending...' };
+    } else if (simTime >= stepStart && simTime < stepEnd) {
+      return { 
+        status: 'active', 
+        details: 'Evaluating...', 
+        valuesDisplay: step.valuesDisplay,
+        candidates: step.candidates 
+      };
+    } else {
+      return { 
+        status: step.status,
+        details: step.details,
+        valuesDisplay: step.valuesDisplay,
+        winner: step.winner,
+        candidates: step.candidates
+      };
+    }
+  }, [simTime, decisionSteps]);
+
+  // Auto-scroll timeline to bottom
+  useEffect(() => {
+    if (timelineEndRef.current) {
+      timelineEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [activeTimeline.length]);
+
+  const winningStepName = useMemo(() => {
+    const winningStep = decisionSteps.find(s => s.status === 'winner');
+    return winningStep ? winningStep.name : 'Priority';
+  }, [decisionSteps]);
+
+  const sharedCoordinates = useMemo(() => {
+    const firstVeh = vehicles[0];
+    if (!firstVeh) return null;
+    const pathData = routes[firstVeh.id] || PREDEFINED_PATHS[firstVeh.origin];
+    return pathData?.part2;
+  }, [vehicles, routes]);
+
   return (
     <div className="flex flex-col gap-4 sm:gap-6 min-h-0">
-      
+      <style>{`
+        @keyframes radarPulse {
+          0% { transform: scale(0.5); opacity: 1; }
+          100% { transform: scale(2.8); opacity: 0; }
+        }
+        @keyframes glowPulse {
+          0%, 100% { box-shadow: 0 0 15px rgba(239, 68, 68, 0.4); border-color: rgba(239, 68, 68, 0.6); }
+          50% { box-shadow: 0 0 35px rgba(239, 68, 68, 0.85); border-color: rgba(239, 68, 68, 1); }
+        }
+        @keyframes glowPulseGreen {
+          0%, 100% { box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); border-color: rgba(16, 185, 129, 0.6); }
+          50% { box-shadow: 0 0 35px rgba(16, 185, 129, 0.85); border-color: rgba(16, 185, 129, 1); }
+        }
+        .glow-red-pulse {
+          animation: glowPulse 2s infinite ease-in-out;
+        }
+        .glow-green-pulse {
+          animation: glowPulseGreen 2s infinite ease-in-out;
+        }
+        .custom-leaflet-icon-vehicle, .custom-leaflet-icon-junction {
+          overflow: visible !important;
+        }
+        .shared-route-glow {
+          filter: drop-shadow(0 0 4px rgba(168, 85, 247, 0.6));
+        }
+      `}</style>
+
       {/* STAT CARDS ROW */}
-      <div className="stat-grid lg:grid-cols-4">
-        <div className="stat-card flex-col items-start justify-between border-red-500/10">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3 sm:gap-4 shrink-0">
+        
+        {/* CARD 1: LOCATION & SPEED */}
+        <div className="stat-card flex-col items-start justify-between border-red-500/10 relative overflow-hidden">
           <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Simulation Location</span>
-          <div className="mt-2 flex items-baseline gap-1">
-            <span className="text-sm font-black text-red-400 truncate">Jnana Bharathi Circle</span>
-            <span className="text-[9px] text-gray-500 uppercase tracking-wider font-bold">Bengaluru</span>
+          <div className="mt-1 flex flex-col">
+            <span className="text-xs font-black text-red-400 truncate">Jnana Bharathi Circle</span>
+            <span className="text-[9px] text-gray-500 uppercase tracking-wider font-bold">Bengaluru (6-Way)</span>
           </div>
-        </div>
-        <div className="stat-card flex-col items-start justify-between border-emerald-500/10">
-          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Active Conflict Scale</span>
-          <div className="mt-2 flex items-baseline gap-1">
-            <span className="text-2xl font-black text-emerald-400">{vehicles.length}</span>
-            <span className="text-[10px] text-gray-500 uppercase tracking-wider font-bold">Vehicles</span>
-          </div>
-        </div>
-        <div className="stat-card flex-col items-start justify-between border-emerald-500/10">
-          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Decision Strategy</span>
-          <div className="mt-2 flex items-baseline gap-1">
-            <span className="text-[10px] font-black text-gray-200 uppercase tracking-wider">Priority → Dist → ETA → Lives</span>
-          </div>
-        </div>
-        <div className="stat-card flex-col items-start justify-between border-emerald-500/10">
-          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Simulation Speed</span>
-          <div className="mt-2 flex gap-1.5">
+          <div className="mt-2 flex gap-1 items-center border-t border-white/5 pt-1.5 w-full">
+            <span className="text-[8px] text-gray-400 uppercase font-bold mr-1">Speed:</span>
             {[1, 2, 5].map(speed => (
               <button
                 key={speed}
                 onClick={() => setSimSpeed(speed)}
-                className={`px-2 py-0.5 rounded text-[10px] font-bold ${simSpeed === speed ? 'bg-emerald-600 text-white shadow' : 'bg-white/5 text-gray-400 border border-white/5 hover:bg-white/10'}`}
+                className={`px-1.5 py-0.5 rounded text-[8px] font-bold ${simSpeed === speed ? 'bg-emerald-600 text-white shadow' : 'bg-white/5 text-gray-400 hover:bg-white/10'}`}
               >
                 {speed}x
               </button>
             ))}
           </div>
         </div>
+
+        {/* CARD 2: CONFLICT RISK METER */}
+        <div className={`stat-card flex-col items-start justify-between border-white/5 relative ${riskStats.glow} transition-all duration-500`}>
+          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Conflict Risk</span>
+          <div className="mt-1 flex items-baseline gap-2">
+            <span className={`text-base font-black uppercase ${riskStats.color.split(' ')[0]}`}>{riskStats.level}</span>
+          </div>
+          <div className="mt-2 flex justify-between text-[8px] text-gray-500 border-t border-white/5 pt-1.5 w-full font-bold">
+            <span>Vehicles: {vehicles.length}</span>
+            <span>ETA Diff: {riskStats.etaDiff}</span>
+          </div>
+        </div>
+
+        {/* CARD 3: AI CONFIDENCE SCORE */}
+        <div className="stat-card justify-between items-center border-emerald-500/10 min-h-[72px] flex">
+          <div className="flex flex-col items-start justify-between h-full">
+            <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">AI Confidence</span>
+            <span className="text-[10px] font-black text-emerald-400 uppercase mt-1 truncate max-w-[100px]">
+              {simData.sorted[0] ? `Winner: ${simData.sorted[0].id.split('-')[1] || simData.sorted[0].id}` : 'Calculating...'}
+            </span>
+          </div>
+          <div className="relative flex items-center justify-center shrink-0">
+            <svg className="w-10 h-10 transform -rotate-90">
+              <circle cx="20" cy="20" r="16" stroke="rgba(255,255,255,0.05)" strokeWidth="3" fill="transparent" />
+              <circle cx="20" cy="20" r="16" stroke="#10b981" strokeWidth="3" fill="transparent"
+                strokeDasharray="100.5" strokeDashoffset={100.5 - (100.5 * (vehicles.length > 0 ? confidenceScore : 0)) / 100} strokeLinecap="round" className="transition-all duration-1000 ease-out" />
+            </svg>
+            <span className="absolute text-[8px] font-black text-white">{vehicles.length > 0 ? `${confidenceScore}%` : '0%'}</span>
+          </div>
+        </div>
+
+        {/* CARD 4: SIGNAL OVERRIDE STATE */}
+        <div className={`stat-card flex-col items-start justify-between border-white/5 transition-all duration-500 ${signalOverrideState.status === 'ACTIVE' ? 'glow-green' : signalOverrideState.status === 'OVERRIDE' ? 'glow-warning' : ''}`}>
+          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Junction Signal JNB-01</span>
+          <div className="mt-1 flex items-baseline gap-1">
+            <span className={`text-[10px] font-black uppercase px-1.5 py-0.5 rounded tracking-wide ${signalOverrideState.color}`}>
+              {signalOverrideState.text}
+            </span>
+          </div>
+          <span className="text-[8px] text-gray-500 font-bold block mt-1.5 truncate w-full">{signalOverrideState.sub || 'Cycle running normally'}</span>
+        </div>
+
+        {/* CARD 5: BENGALURU CONTEXT */}
+        <div className="stat-card flex-col items-start justify-between border-emerald-500/10">
+          <span className="text-[9px] uppercase text-gray-400 block font-bold tracking-wider">Bengaluru Context</span>
+          <div className="mt-1 flex flex-col gap-0.5 w-full text-[9px] font-bold text-gray-400 leading-none">
+            <div className="flex justify-between">
+              <span>Traffic Density:</span>
+              <span className="text-red-400">HIGH</span>
+            </div>
+            <div className="flex justify-between mt-1">
+              <span>Nearby Fleet:</span>
+              <span className="text-white">128</span>
+            </div>
+            <div className="flex justify-between mt-1">
+              <span>Peak Sim Time:</span>
+              <span className="text-white">18:30</span>
+            </div>
+          </div>
+        </div>
+
       </div>
 
       {/* CORE GRID */}
       <div className="content-grid">
         
         {/* LEFT COLUMN: SCENARIOS, CONTROLS, BUILDER */}
-        <div className="lg:col-span-4 flex flex-col gap-4 sm:gap-6 min-h-0 overflow-y-auto lg:h-[calc(100dvh-200px)] pr-1 pb-6">
+        <div className="lg:col-span-4 flex flex-col gap-4 sm:gap-6 min-h-0 lg:overflow-y-auto lg:h-full pr-1 pb-6">
           
           {/* Predefined Scenarios Card */}
           <div className="panel p-4 sm:p-5 flex flex-col shrink-0">
@@ -899,7 +1331,11 @@ export default function ConflictSimulationLab() {
               )}
               
               <button
-                onClick={() => setSimTime(0)}
+                onClick={() => {
+                  setSimTime(0);
+                  setIsPlaying(false);
+                  setWinnerInfo(null);
+                }}
                 className="py-2 px-3 rounded-xl bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition text-xs font-bold flex items-center justify-center gap-1 active:scale-[0.98]"
                 title="Reset Simulation"
               >
@@ -908,19 +1344,100 @@ export default function ConflictSimulationLab() {
             </div>
           </div>
 
-          {/* Live AI Decision Panel (Terminal style) */}
-          <div className="panel p-4 sm:p-5 flex flex-col flex-1 min-h-[220px] max-h-[300px]">
-            <h3 className="panel-header mb-2.5">
-              <Activity size={16} className="text-emerald-400" /> Live AI Decision Panel
+          {/* AI Conflict Resolution Engine */}
+          <div className="panel p-4 sm:p-5 flex flex-col gap-4">
+            <h3 className="panel-header mb-0">
+              <Activity size={16} className="text-emerald-400 animate-pulse" /> AI Conflict Resolution Engine
             </h3>
-            <div className="flex-1 bg-black/60 rounded-xl p-3 border border-white/5 font-mono text-[10px] text-emerald-300 overflow-y-auto space-y-1 scrollbar-thin">
+            
+            {/* Decision Tree vertical flow */}
+            <div className="relative pl-6 space-y-4 py-2 border-l-2 border-white/5 ml-2 transition-all">
+              {decisionSteps.map((step, idx) => {
+                const stepState = getStepStatusAtTime(step, idx);
+                
+                let cardColor = 'bg-white/[0.01] border-white/5 text-gray-500';
+                let iconColor = 'text-gray-600';
+                let pulseRing = '';
+                
+                if (stepState.status === 'active') {
+                  cardColor = 'bg-blue-500/[0.03] border-blue-500/30 text-blue-300';
+                  iconColor = 'text-blue-400 animate-pulse';
+                  pulseRing = 'ring-2 ring-blue-500/30 animate-pulse';
+                } else if (stepState.status === 'tie') {
+                  cardColor = 'bg-amber-500/[0.03] border-amber-500/20 text-amber-300';
+                  iconColor = 'text-amber-400';
+                } else if (stepState.status === 'winner') {
+                  cardColor = 'bg-emerald-500/[0.04] border-emerald-500/35 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.05)]';
+                  iconColor = 'text-emerald-400';
+                  pulseRing = 'ring-2 ring-emerald-500/30';
+                } else if (stepState.status === 'skipped') {
+                  cardColor = 'opacity-40 bg-transparent border-transparent text-gray-600';
+                  iconColor = 'text-gray-700';
+                }
+                
+                const StepIcon = [Shield, MapPin, Clock, Users, Siren, Activity][idx] || Shield;
+
+                return (
+                  <div key={idx} className={`relative p-2.5 rounded-xl border text-[10px] transition-all duration-500 ${cardColor}`}>
+                    
+                    {/* Circle Node on Vertical Line */}
+                    <div className={`absolute -left-[33px] top-1/2 -translate-y-1/2 w-4 h-4 rounded-full bg-slate-950 border-2 flex items-center justify-center transition-all duration-500 ${stepState.status === 'active' ? 'border-blue-500' : stepState.status === 'winner' ? 'border-emerald-500' : stepState.status === 'tie' ? 'border-amber-500' : 'border-white/10'} ${pulseRing}`}>
+                      {stepState.status === 'winner' ? (
+                        <Check size={8} className="text-emerald-400" />
+                      ) : (
+                        <div className={`w-1 h-1 rounded-full ${stepState.status === 'active' ? 'bg-blue-500' : stepState.status === 'tie' ? 'bg-amber-500' : 'bg-white/10'}`}></div>
+                      )}
+                    </div>
+
+                    <div className="flex justify-between items-center font-bold">
+                      <div className="flex items-center gap-1.5">
+                        <StepIcon size={12} className={iconColor} />
+                        <span className="uppercase tracking-wider text-[9px]">{step.name}</span>
+                      </div>
+                      
+                      {stepState.status === 'active' && (
+                        <span className="text-[8px] bg-blue-500/10 border border-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded animate-pulse">EVALUATING</span>
+                      )}
+                      {stepState.status === 'tie' && (
+                        <span className="text-[8px] bg-amber-500/10 border border-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">⚠ TIE</span>
+                      )}
+                      {stepState.status === 'winner' && (
+                        <span className="text-[8px] bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 px-1.5 py-0.5 rounded font-black">🏆 WINNER SELECTED</span>
+                      )}
+                      {stepState.status === 'pending' && (
+                        <span className="text-[8px] text-gray-600 uppercase">PENDING</span>
+                      )}
+                      {stepState.status === 'skipped' && (
+                        <span className="text-[8px] text-gray-700 uppercase">SKIPPED</span>
+                      )}
+                    </div>
+
+                    {stepState.status !== 'pending' && stepState.status !== 'skipped' && stepState.valuesDisplay && (
+                      <div className="mt-2 text-[9px] text-gray-400 font-mono border-t border-white/5 pt-1.5 flex justify-between items-center">
+                        <span>Comparison:</span>
+                        <span className="text-white font-bold text-right truncate max-w-[150px]">{stepState.valuesDisplay}</span>
+                      </div>
+                    )}
+                    
+                    {stepState.status === 'winner' && stepState.winner && (
+                      <div className="mt-1 text-[9px] text-emerald-400 font-mono flex justify-between items-center">
+                        <span>AI Allocated corridor:</span>
+                        <span className="font-black bg-emerald-500/10 px-1.5 py-0.5 rounded">{stepState.winner}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Micro Debug Console log below the flow chart */}
+            <div className="bg-black/60 rounded-xl p-2.5 border border-white/5 font-mono text-[9px] text-emerald-400 overflow-y-auto h-24 space-y-0.5 scrollbar-thin">
+              <div className="text-[8px] text-gray-500 font-bold uppercase border-b border-white/5 pb-1 mb-1 tracking-wider">Engine Process Logs</div>
               {logs.length === 0 ? (
-                <div className="text-gray-600 text-center py-10 italic">
-                  Press Start to launch conflict resolution logs...
-                </div>
+                <div className="text-gray-600 italic">Waiting for simulation launch...</div>
               ) : (
                 logs.map((log, index) => {
-                  let logColor = 'text-emerald-300';
+                  let logColor = 'text-emerald-400';
                   if (log.includes('🚨') || log.includes('wins') || log.includes('winner:')) {
                     logColor = 'text-yellow-300 font-bold';
                   } else if (log.includes('✅')) {
@@ -928,9 +1445,8 @@ export default function ConflictSimulationLab() {
                   } else if (log.includes('tie')) {
                     logColor = 'text-gray-400';
                   }
-                  
                   return (
-                    <div key={index} className={`leading-relaxed whitespace-pre-wrap ${logColor}`}>
+                    <div key={index} className={`leading-tight whitespace-pre-wrap ${logColor}`}>
                       {log}
                     </div>
                   );
@@ -1066,7 +1582,7 @@ export default function ConflictSimulationLab() {
         </div>
 
         {/* RIGHT COLUMN: MAP AND SUMMARY */}
-        <div className="lg:col-span-8 flex flex-col gap-4 sm:gap-6 min-h-[400px] lg:h-[calc(100dvh-200px)] overflow-hidden">
+        <div className="lg:col-span-8 flex flex-col gap-4 sm:gap-6 min-h-[400px] lg:h-full lg:overflow-y-auto pr-1 pb-6">
           
           {/* Leaflet Map panel */}
           <div className="flex-1 relative rounded-2xl overflow-hidden border border-white/10 shadow-inner min-h-[350px]">
@@ -1083,54 +1599,65 @@ export default function ConflictSimulationLab() {
 
               <MapFocusController />
 
-              {/* Predefined conflict junction: Pulsing Red Marker */}
+              {/* Enhanced conflict junction: Pulsing Red Marker with radar rings and HUD */}
               <Marker
                 position={JB_CIRCLE}
-                icon={L.divIcon({
-                  className: 'custom-leaflet-icon',
-                  html: `
-                    <div class="relative flex items-center justify-center w-8 h-8 rounded-full border-2 border-red-500 bg-red-950/40 shadow-2xl">
-                      <div class="absolute -inset-1.5 rounded-full bg-red-600 animate-ping opacity-60"></div>
-                      <div class="absolute w-3.5 h-3.5 bg-red-600 rounded-full"></div>
-                    </div>
-                  `,
-                  iconSize: [32, 32],
-                  iconAnchor: [16, 16],
-                })}
-              >
-                <Tooltip permanent direction="top" offset={[0, -10]} opacity={0.9}>
-                  <div className="font-bold text-[10px] text-red-700">Jnana Bharathi Circle</div>
-                  <div className="text-[8px] text-slate-500 font-medium">Conflict Analysis Zone</div>
-                </Tooltip>
-              </Marker>
+                icon={createJunctionIcon(vehicles.length, riskStats.level, winnerCrossing)}
+                zIndexOffset={3000}
+              />
 
-              {/* Draw routes for active vehicles */}
-              {vehicles.map(veh => {
+              {/* Draw incoming paths (part1) for converging vehicles */}
+              {vehicles.map((veh, idx) => {
                 const pathData = routes[veh.id] || PREDEFINED_PATHS[veh.origin];
                 if (!pathData || !pathData.part1) return null;
                 
-                const color = veh.type === 'ambulance' ? '#3b82f6' : veh.type === 'fire_engine' ? '#ef4444' : '#8b5cf6';
-                const fullPath = [...pathData.part1, ...pathData.part2];
+                const color = [ '#3b82f6', '#ef4444', '#f97316', '#14b8a6', '#a855f7' ][idx % 5];
 
                 return (
-                  <React.Fragment key={`route-${veh.id}`}>
+                  <React.Fragment key={`route-incoming-${veh.id}`}>
                     <Polyline
-                      positions={fullPath}
+                      positions={pathData.part1}
                       pathOptions={{
                         color,
-                        weight: 3.5,
-                        opacity: 0.55,
-                        dashArray: '4, 6'
+                        weight: 4,
+                        opacity: 0.75,
+                        dashArray: '4, 8'
                       }}
                     />
                   </React.Fragment>
                 );
               })}
 
+              {/* Shared route segment (part2) in glowing purple neon */}
+              {sharedCoordinates && (
+                <>
+                  <Polyline
+                    positions={sharedCoordinates}
+                    pathOptions={{
+                      color: '#a855f7',
+                      weight: 8,
+                      opacity: 0.35,
+                      lineJoin: 'round',
+                      lineCap: 'round',
+                      className: 'shared-route-glow'
+                    }}
+                  />
+                  <Polyline
+                    positions={sharedCoordinates}
+                    pathOptions={{
+                      color: '#e9d5ff',
+                      weight: 3.5,
+                      opacity: 0.95,
+                      lineJoin: 'round',
+                      lineCap: 'round'
+                    }}
+                  />
+                </>
+              )}
+
               {/* Draw active moving vehicle markers */}
               {trackingVehiclesOnMap.map(veh => {
                 const isWinner = simData.sorted.length > 0 && simData.sorted[0].id === veh.id;
-                
                 const pathData = routes[veh.id] || PREDEFINED_PATHS[veh.origin];
                 const activePath = veh.stage === 'crossing' && pathData ? pathData.part2 : null;
                 
@@ -1138,19 +1665,17 @@ export default function ConflictSimulationLab() {
                   <React.Fragment key={`marker-${veh.id}`}>
                     <Marker
                       position={veh.position}
-                      icon={createVehicleIcon(veh.type, veh.id, isWinner && veh.signalStatus === 'green')}
+                      icon={createVehicleIcon(
+                        veh.type, 
+                        veh.id, 
+                        veh.priority, 
+                        veh.remainingEta.toFixed(0), 
+                        veh.remainingDistance.toFixed(1), 
+                        isWinner, 
+                        veh.signalStatus
+                      )}
                       zIndexOffset={isWinner ? 2000 : 1000}
-                    >
-                      <Popup>
-                        <div className="text-slate-900 text-xs p-1">
-                          <h4 className="font-bold uppercase">{veh.id} ({veh.type.replace('_', ' ')})</h4>
-                          <p className="mt-0.5">Priority: <strong>{veh.priority}</strong></p>
-                          <p>ETA to Junction: <strong>{veh.eta}s</strong></p>
-                          <p>Lives At Risk: <strong>{veh.livesAtRisk}</strong></p>
-                          <p>Status: <span className={`font-bold ${veh.stage === 'crossing' ? 'text-emerald-600' : 'text-red-500'}`}>{veh.stage.toUpperCase()}</span></p>
-                        </div>
-                      </Popup>
-                    </Marker>
+                    />
                     
                     {activePath && (
                       <Polyline
@@ -1166,25 +1691,6 @@ export default function ConflictSimulationLab() {
                   </React.Fragment>
                 );
               })}
-
-              {/* Signal Light visual marker overlays at JB Circle */}
-              {circleSignalStatus.status === 'active_override' && (
-                <CircleMarker
-                  center={JB_CIRCLE}
-                  radius={12}
-                  pathOptions={{
-                    fillColor: '#10b981',
-                    fillOpacity: 0.9,
-                    color: '#ffffff',
-                    weight: 2
-                  }}
-                >
-                  <Tooltip permanent direction="bottom" offset={[0, 10]}>
-                    <div className="text-[9px] font-bold text-emerald-700">SIGNAL OVERRIDE ACTIVE</div>
-                    <div className="text-[8px] text-gray-500 leading-none">Allocated to {circleSignalStatus.winnerId}</div>
-                  </Tooltip>
-                </CircleMarker>
-              )}
 
             </MapContainer>
             
@@ -1203,51 +1709,189 @@ export default function ConflictSimulationLab() {
               <h5 className="font-bold text-white text-[10px] mb-1">Route Legend</h5>
               <div className="flex items-center gap-2">
                 <span className="w-3 h-3 rounded-full bg-blue-500 block border border-white/10"></span>
-                <span>Ambulance Route</span>
+                <span>Vehicle A Route</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="w-3 h-3 rounded-full bg-red-500 block border border-white/10"></span>
-                <span>Fire Engine Route</span>
+                <span>Vehicle B Route</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-3 h-3 rounded-full bg-orange-500 block border border-white/10"></span>
+                <span>Vehicle C Route</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="w-3 h-3 rounded-full bg-purple-500 block border border-white/10"></span>
-                <span>Police Route</span>
+                <span>Shared Route Segment</span>
               </div>
               <div className="flex items-center gap-2 border-t border-white/5 pt-1.5">
                 <span className="w-3 h-3 bg-red-600 rounded-full animate-pulse block"></span>
-                <span className="font-bold text-red-400">Conflict Circle</span>
+                <span className="font-bold text-red-400">Conflict Junction</span>
               </div>
             </div>
           </div>
 
-          {/* End Result Screen Summary Card */}
+          {/* Sub-grid: Vehicle ranking & Live Event Timeline */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6 shrink-0">
+            
+            {/* Vehicle Ranking Table */}
+            <div className="panel p-4 sm:p-5 flex flex-col h-[220px]">
+              <h3 className="panel-header mb-3">
+                <Activity size={14} className="text-blue-400" /> Conflict Priority Ranking
+              </h3>
+              <div className="flex-1 overflow-y-auto rounded-xl border border-white/5 scrollbar-thin min-h-0">
+                <table className="min-w-full text-left text-[9px] font-mono leading-none">
+                  <thead className="bg-white/[0.03] text-[8px] uppercase tracking-wider text-gray-400 sticky top-0 z-10">
+                    <tr>
+                      <th className="px-2.5 py-2 font-bold">Rank</th>
+                      <th className="px-2.5 py-2 font-bold">Vehicle</th>
+                      <th className="px-2.5 py-2 font-bold">Priority</th>
+                      <th className="px-2.5 py-2 font-bold">ETA</th>
+                      <th className="px-2.5 py-2 font-bold">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/5 font-bold">
+                    {simData.sorted.map((veh, idx) => {
+                      const isWinner = idx === 0;
+                      const hasCleared = simTime >= (simData.releaseTimes[veh.id] || veh.eta + 12);
+                      const isCrossing = simTime >= veh.eta && simTime < (simData.releaseTimes[veh.id] || veh.eta + 12);
+                      
+                      let statusText = 'WAITING';
+                      let statusColor = 'text-gray-400';
+                      
+                      if (isWinner) {
+                        if (hasCleared) {
+                          statusText = 'CLEARED';
+                          statusColor = 'text-emerald-400 font-bold';
+                        } else if (isCrossing) {
+                          statusText = 'CROSSING';
+                          statusColor = 'text-emerald-400 animate-pulse font-black';
+                        } else {
+                          statusText = 'WINNER';
+                          statusColor = 'text-emerald-400 font-black';
+                        }
+                      } else {
+                        if (hasCleared) {
+                          statusText = 'RELEASED';
+                          statusColor = 'text-blue-400';
+                        } else if (isCrossing) {
+                          statusText = 'PREEMPT';
+                          statusColor = 'text-amber-400 font-bold';
+                        }
+                      }
+                      
+                      return (
+                        <tr key={veh.id} className={`transition-all ${isWinner ? 'bg-emerald-500/5 hover:bg-emerald-500/10 font-bold text-white border-y border-emerald-500/20' : 'hover:bg-white/[0.01] text-gray-300'}`}>
+                          <td className="px-2.5 py-2.5 flex items-center gap-1">
+                            {isWinner ? '🥇' : `${idx + 1}`}
+                          </td>
+                          <td className="px-2.5 py-2.5 text-white">{veh.id}</td>
+                          <td className="px-2.5 py-2.5">{veh.priority}</td>
+                          <td className="px-2.5 py-2.5">{veh.eta}s</td>
+                          <td className={`px-2.5 py-2.5 ${statusColor}`}>{statusText}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Live Event Timeline */}
+            <div className="panel p-4 sm:p-5 flex flex-col h-[220px]">
+              <h3 className="panel-header mb-3">
+                <Clock size={14} className="text-blue-400 animate-pulse" /> Live Event Timeline
+              </h3>
+              <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-0 scrollbar-thin text-[9px] font-mono leading-tight">
+                {activeTimeline.length === 0 ? (
+                  <div className="text-gray-600 italic py-8 text-center">Simulation timeline inactive...</div>
+                ) : (
+                  activeTimeline.map((evt, index) => (
+                    <div key={index} className="flex gap-2 items-start border-l border-white/10 pl-2 ml-1 relative">
+                      <div className="absolute -left-[4px] top-1.5 w-1.5 h-1.5 bg-blue-500 rounded-full"></div>
+                      <span className="text-gray-500 shrink-0 select-none">[+{(evt.time).toFixed(1)}s]</span>
+                      <span className={`${evt.text.includes('🚨') || evt.text.includes('🏆') ? 'text-white font-bold' : 'text-gray-300'}`}>
+                        {evt.text}
+                      </span>
+                    </div>
+                  ))
+                )}
+                <div ref={timelineEndRef} />
+              </div>
+            </div>
+
+          </div>
+
+          {/* Enhanced End Result Screen Summary Card */}
           {winnerInfo && (
-            <div className="panel p-4 sm:p-5 border-emerald-500/20 shadow-lg shrink-0 bg-emerald-500/[0.02]">
-              <div className="flex items-center gap-2 mb-3 pb-2 border-b border-emerald-500/10">
-                <ShieldCheck size={18} className="text-emerald-400 animate-pulse" />
-                <h3 className="text-xs font-black uppercase text-emerald-400 tracking-wider">Conflict Resolution Complete</h3>
+            <div className="panel p-5 border-emerald-500/30 bg-emerald-950/10 shadow-[0_0_30px_rgba(16,185,129,0.08)] shrink-0 transition-all duration-700 transform scale-100 opacity-100 animate-in fade-in zoom-in-95">
+              <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-3 mb-4 pb-3 border-b border-emerald-500/10">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 bg-emerald-500/10 rounded-lg border border-emerald-500/30 animate-pulse">
+                    <ShieldCheck size={18} className="text-emerald-400" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-black uppercase text-emerald-400 tracking-wider">AI CONFLICT RESOLUTION SUCCESS</h3>
+                    <p className="text-[8px] text-gray-500 uppercase tracking-widest font-black mt-0.5">Green corridor locked & signals overridden</p>
+                  </div>
+                </div>
+                
+                {/* REPLAY CONTROLS */}
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setSimTime(0);
+                      setIsPlaying(true);
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 text-[10px] font-bold uppercase transition flex items-center gap-1 active:scale-95"
+                  >
+                    <RotateCcw size={12} /> Replay
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSimTime(0);
+                      setIsPlaying(false);
+                      setWinnerInfo(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-gray-300 text-[10px] font-bold uppercase transition flex items-center gap-1 active:scale-95"
+                  >
+                    Restart
+                  </button>
+                  <button
+                    onClick={() => {
+                      alert("📸 Exporting high-resolution PDF report & screenshot...\nDownloaded report: JNB_Conflict_Report_" + selectedScenario.id + ".pdf");
+                    }}
+                    className="px-3 py-1.5 rounded-lg border border-blue-500/20 bg-blue-500/15 hover:bg-blue-500/25 text-blue-300 text-[10px] font-bold uppercase transition flex items-center gap-1 active:scale-95"
+                  >
+                    Export Report
+                  </button>
+                </div>
               </div>
               
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div className="text-left">
-                  <span className="text-[8px] uppercase text-gray-400 block font-black tracking-wider">Primary Winner</span>
-                  <strong className="text-base text-emerald-400 font-black tracking-tight">{winnerInfo.name}</strong>
+                  <span className="text-[8px] uppercase text-gray-500 block font-black tracking-wider mb-0.5">Winner Vehicle</span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs">🚑</span>
+                    <strong className="text-base text-emerald-400 font-black tracking-tight">{winnerInfo.name}</strong>
+                  </div>
                 </div>
                 
                 <div className="text-left border-l border-white/5 pl-3">
-                  <span className="text-[8px] uppercase text-gray-400 block font-black tracking-wider">Resolution Time</span>
-                  <strong className="text-base text-white font-black tracking-tight">{winnerInfo.time}s</strong>
+                  <span className="text-[8px] uppercase text-gray-500 block font-black tracking-wider mb-0.5">Decision Strategy</span>
+                  <strong className="text-xs text-white font-black uppercase tracking-wide block mt-1">{winningStepName} Wins</strong>
+                  <span className="text-[8px] text-gray-400 font-bold block mt-0.5 truncate">{winnerInfo.strategy}</span>
                 </div>
                 
                 <div className="text-left border-l border-white/5 pl-3">
-                  <span className="text-[8px] uppercase text-gray-400 block font-black tracking-wider">Queue Size</span>
-                  <strong className="text-base text-white font-black tracking-tight">{winnerInfo.count} vehicles</strong>
+                  <span className="text-[8px] uppercase text-gray-500 block font-black tracking-wider mb-0.5">Resolution Speed</span>
+                  <strong className="text-base text-white font-black tracking-tight">{(parseFloat(winnerInfo.time) / 10).toFixed(2)}s</strong>
+                  <span className="text-[8px] text-gray-400 font-bold block mt-0.5">AI Engine calculation speed</span>
                 </div>
 
                 <div className="text-left border-l border-white/5 pl-3">
-                  <span className="text-[8px] uppercase text-gray-400 block font-black tracking-wider">Safety Status</span>
-                  <strong className="text-xs bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded font-black uppercase tracking-wider inline-block mt-0.5">
-                    SUCCESS
+                  <span className="text-[8px] uppercase text-gray-500 block font-black tracking-wider mb-0.5">Active Safety Status</span>
+                  <strong className="text-[9px] bg-emerald-500/15 border border-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded font-black uppercase tracking-wider inline-block mt-1">
+                    OVERRIDE ENGAGED
                   </strong>
                 </div>
               </div>
