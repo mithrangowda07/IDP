@@ -192,6 +192,28 @@ async function createTables() {
       latitude DECIMAL(10, 8) NOT NULL,
       longitude DECIMAL(11, 8) NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    // Incident acknowledgements table
+    `CREATE TABLE IF NOT EXISTS incident_acknowledgements (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      incident_id INT NOT NULL,
+      admin_id INT NOT NULL,
+      acknowledged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      status VARCHAR(50) NOT NULL,
+      FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE,
+      FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE
+    )`,
+
+    // Incident escalations table
+    `CREATE TABLE IF NOT EXISTS incident_escalations (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      incident_id INT NOT NULL,
+      escalation_level INT NOT NULL,
+      escalated_to_role VARCHAR(50) NOT NULL,
+      escalated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      status VARCHAR(50) NOT NULL DEFAULT 'escalated',
+      FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
     )`
   ];
 

@@ -1,5 +1,7 @@
 import React from 'react';
 import { Power } from 'lucide-react';
+import AdminStatusBadge from './AdminStatusBadge';
+import { useNotifications } from '../context/NotificationContext';
 
 export default function DashboardShell({
   icon: Icon,
@@ -12,8 +14,20 @@ export default function DashboardShell({
   banner,
   children
 }) {
+  const { adminStatus, onlineOperators, isFlashing } = useNotifications() || { adminStatus: 'offline', onlineOperators: [], isFlashing: false };
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell min-h-screen transition-colors duration-500 ${isFlashing ? 'dashboard-flash' : ''}`}>
+      <style>{`
+        @keyframes dash-pulse {
+          0%, 100% { background-color: transparent; }
+          50% { background-color: rgba(239, 68, 68, 0.08); }
+        }
+        .dashboard-flash {
+          animation: dash-pulse 1.5s infinite ease-in-out;
+        }
+      `}</style>
+
       <nav className="dashboard-nav">
         <div className="dashboard-nav-inner">
           <div className="flex items-center gap-3 min-w-0 shrink-0">
@@ -48,6 +62,11 @@ export default function DashboardShell({
                   ))}
                 </div>
               </div>
+            )}
+
+            {/* Admin Online Status Badge */}
+            {adminStatus !== 'offline' && (
+              <AdminStatusBadge status={adminStatus} onlineOperators={onlineOperators} />
             )}
 
             <button

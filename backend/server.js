@@ -24,6 +24,10 @@ const io = socketModule.initSocket(server);
 app.use(cors());
 app.use(express.json());
 
+// Import and register Notification Router
+const notificationRoutes = require('./routes/notificationRoutes');
+app.use('/api/notifications', notificationRoutes);
+
 const JWT_SECRET = process.env.JWT_SECRET || 'emergency-jwt-super-secret-key-1536';
 const PORT = process.env.PORT || 5000;
 const INCIDENT_TYPES = ['medical_emergency', 'accident', 'fire', 'gas_leak', 'building_collapse', 'other'];

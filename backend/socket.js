@@ -532,8 +532,20 @@ function initSocket(server) {
     }
   });
 
+  // Wire up the notification services
+  const socketNotificationService = require('./services/SocketNotificationService');
+  const alarmGateway = require('./services/AlarmGateway');
+  const escalationService = require('./services/EscalationService');
+
+  socketNotificationService.setIo(io);
+  alarmGateway.setIo(io);
+  escalationService.start(io);
+
   io.on('connection', (socket) => {
     console.log(`Socket client connected: ${socket.id}`);
+
+    // Register active notification tracking and status events
+    socketNotificationService.registerSocket(socket);
 
     // Join room based on user role or custom room
     socket.on('join_role', (role) => {
@@ -561,11 +573,16 @@ function getIo() {
 // Socket emitter helper functions
 function broadcastNewIncident(incident) {
   if (!io) return;
-  if (incident.type === 'accident' || incident.type === 'medical_emergency' || incident.type === 'other') {
-    io.to('medical_admin').emit('new_incident', incident);
-  } else if (incident.type === 'fire' || incident.type === 'gas_leak' || incident.type === 'building_collapse') {
-    io.to('fire_admin').emit('new_incident', incident);
-  }
+
+  // 1. Route the incident alert (notifies alternative admins if primary is offline)
+  const socketNotificationService = require('./services/SocketNotificationService');
+  socketNotificationService.routeIncidentAlert(incident);
+
+  // 2. Trigger the audible alarms on active consoles
+  const alarmGateway = require('./services/AlarmGateway');
+  alarmGateway.triggerAlarm(incident);
+
+  // 3. Status changes for citizens
   io.to('citizen_user').emit('incident_status_change', { incidentId: incident.id, status: incident.status });
 }
 
