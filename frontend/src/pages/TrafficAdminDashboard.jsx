@@ -407,7 +407,7 @@ export default function TrafficAdminDashboard({ user, onLogout }) {
             </button>
           </form>
 
-          <div className="overflow-x-auto rounded-xl border border-white/5">
+          <div className="max-h-[420px] overflow-auto rounded-xl border border-white/5">
             <table className="min-w-full text-left text-[11px]">
               <thead className="bg-white/[0.03] text-[10px] uppercase tracking-wider text-gray-400">
                 <tr>

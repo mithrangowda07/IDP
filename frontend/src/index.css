@@ -48,11 +48,11 @@
   }
 
   .dashboard-main {
-    @apply flex-1 w-full min-h-0 overflow-y-auto lg:overflow-hidden;
+    @apply flex-1 w-full min-h-0 overflow-y-auto;
   }
 
   .dashboard-content {
-    @apply max-w-[1600px] mx-auto w-full px-4 sm:px-6 py-4 sm:py-6 flex flex-col gap-4 sm:gap-6 min-h-0 lg:h-[calc(100dvh-72px)] lg:overflow-hidden;
+    @apply max-w-[1600px] mx-auto w-full px-4 sm:px-6 py-4 sm:py-6 flex flex-col gap-4 sm:gap-6 min-h-0 lg:h-auto lg:overflow-visible;
   }
 
   .dashboard-content.has-banner {
@@ -154,7 +154,7 @@
   }
 
   .content-grid {
-    @apply grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 items-stretch flex-1 min-h-0 lg:overflow-hidden;
+    @apply grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 items-stretch flex-1 min-h-0 lg:overflow-visible;
   }
 
   .sidebar-panel {

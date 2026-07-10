@@ -49,12 +49,13 @@ def detect_alert(payload):
     last_pitch = pitch
     last_roll = roll
 
-    if accident:
-        return "accident", max(abs(pitch), abs(roll))
+    
     if str(gas).lower() not in ["clean", "normal", "0"] or mq2 > 650:
         return "gas", mq2 or 1
-    if flame == 1 or temperature > 58:
+    if flame == 1 and temperature > 40:
         return "fire", max(temperature, flame)
+    if accident:
+        return "accident", max(abs(pitch), abs(roll))
     return None, None
 
 
