@@ -4,6 +4,7 @@ import { connectSocket, disconnectSocket, socket } from '../services/socket';
 import MapPanel from '../components/MapPanel';
 import DashboardShell from '../components/DashboardShell';
 import { Shield, List, Building, Check, X, ShieldAlert, RefreshCw, Car, Navigation, Settings, Phone } from 'lucide-react';
+import { useNotifications } from '../context/NotificationContext';
 
 export default function AdminDashboard({ user, onLogout }) {
   const [activeTab, setActiveTab] = useState('incidents');
@@ -40,9 +41,42 @@ export default function AdminDashboard({ user, onLogout }) {
   const [activeDispatch, setActiveDispatch] = useState(null);
   const selectedIncidentRef = useRef(null);
 
+  const { selectedIncidentForDashboard, setSelectedIncidentForDashboard } = useNotifications() || {};
+
   useEffect(() => {
     selectedIncidentRef.current = selectedIncident;
   }, [selectedIncident]);
+
+  useEffect(() => {
+    if (selectedIncidentForDashboard) {
+      console.log('Auto-selecting incident from notification event:', selectedIncidentForDashboard);
+      const incidentId = typeof selectedIncidentForDashboard === 'object' ? selectedIncidentForDashboard.id : selectedIncidentForDashboard;
+      
+      // Look for the incident in our local list first
+      const foundIncident = incidents.find(inc => String(inc.id) === String(incidentId));
+      if (foundIncident) {
+        handleSelectIncident(foundIncident);
+      } else {
+        // Fetch details from backend if not yet in state list
+        incidentsAPI.getIncidentDetails(incidentId).then(res => {
+          const fetchedIncident = res.data.incident || res.data;
+          // Add to incidents list
+          setIncidents(prev => {
+            if (!prev.some(inc => String(inc.id) === String(fetchedIncident.id))) {
+              return [fetchedIncident, ...prev];
+            }
+            return prev;
+          });
+          handleSelectIncident(fetchedIncident);
+        }).catch(err => console.error('Failed to auto-select incident details:', err));
+      }
+      
+      // Reset context trigger
+      if (setSelectedIncidentForDashboard) {
+        setSelectedIncidentForDashboard(null);
+      }
+    }
+  }, [selectedIncidentForDashboard, incidents]);
 
   useEffect(() => {
     // Connect to Socket.IO
@@ -668,7 +702,7 @@ export default function AdminDashboard({ user, onLogout }) {
                           <p className="text-[10px] text-gray-400 mt-0.5">Dist: <strong>{service.distance} km</strong> | Avail: <strong className={service.availableVehicles > 0 ? 'text-emerald-400' : 'text-red-400'}>{service.availableVehicles}</strong></p>
                         </div>
 
-                        {selectedIncident.status === 'reported' ? (
+                        {['reported', 'verified'].includes(selectedIncident.status) ? (
                           <button
                             onClick={() => handleAlertService(service.id)}
                             className={`px-3 py-1.5 text-xs font-bold rounded-lg text-white transition ${service.availableVehicles > 0 ? 'bg-blue-600 hover:bg-blue-500 active:scale-95 shadow-md shadow-blue-900/20' : 'bg-gray-700 cursor-not-allowed opacity-50'}`}

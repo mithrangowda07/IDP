@@ -17,6 +17,7 @@ export const NotificationProvider = ({ children, user }) => {
   const [countdownSeconds, setCountdownSeconds] = useState(0); // Escalation countdown
   const [adminStatus, setAdminStatus] = useState('offline'); // online | idle | offline
   const [onlineOperators, setOnlineOperators] = useState([]); // Statuses of other admins
+  const [selectedIncidentForDashboard, setSelectedIncidentForDashboard] = useState(null); // Triggers auto-selection on dashboard
 
   const activeAlertsRef = useRef([]);
   const countdownIntervalRef = useRef(null);
@@ -304,11 +305,15 @@ export const NotificationProvider = ({ children, user }) => {
       const res = await NotificationService.acknowledge(incidentId);
       if (res.data && res.data.success) {
         console.log(`[NotificationContext] Acknowledge call succeeded for #${incidentId}`);
+        // Select it for the dashboard view
+        setSelectedIncidentForDashboard(incidentId);
         // Remove from local queue
         setActiveAlerts(prev => prev.filter(alert => alert.id !== incidentId));
       }
     } catch (err) {
       console.error('[NotificationContext] Failed to acknowledge incident:', err);
+      // Select it for dashboard view even on fallback
+      setSelectedIncidentForDashboard(incidentId);
       // Fallback: remove from queue in case network error occurs but we need to silence it
       setActiveAlerts(prev => prev.filter(alert => alert.id !== incidentId));
     }
@@ -323,14 +328,9 @@ export const NotificationProvider = ({ children, user }) => {
     // Silence local alarm sound
     EmergencyAlarm.stop();
     TitleFlasher.stop();
-    
-    // We keep the alert in active queue so other admins still see escalation countdown, 
-    // but the local operator has silenced it. Alternatively, viewing can be treated as 
-    // acknowledgement or a soft silencing. The requirement says:
-    // "The alarm must stop ONLY when: Admin clicks View Incident OR Admin clicks Acknowledge"
-    // So we just stop the alarm locally, but do not necessarily acknowledge on the database 
-    // unless they click the explicit Acknowledge button. 
-    // Let's also remove it from the active alerts queue locally so the popup closes!
+    // Select it for the dashboard view
+    setSelectedIncidentForDashboard(incidentId);
+    // Remove from active alerts queue locally so the popup closes
     setActiveAlerts(prev => prev.filter(alert => alert.id !== incidentId));
   };
 
@@ -345,6 +345,8 @@ export const NotificationProvider = ({ children, user }) => {
         countdownSeconds,
         adminStatus,
         onlineOperators,
+        selectedIncidentForDashboard,
+        setSelectedIncidentForDashboard,
         setAdminStatus,
         acknowledgeAlert,
         viewIncident
